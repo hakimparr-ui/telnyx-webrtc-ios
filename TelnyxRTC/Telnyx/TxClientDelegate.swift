@@ -53,6 +53,21 @@ public protocol TxClientDelegate: AnyObject {
     ///   - success: Whether the push notification operation succeeded
     ///   - message: Descriptive message about the operation result
     func onPushDisabled(success: Bool, message: String)
+
+    /// Called after a pre-INVITE VoIP push decline reaches a terminal
+    /// provider result.
+    /// - Parameters:
+    ///   - callId: The app-facing identifier supplied to
+    ///     `endCallFromCallkit`.
+    ///   - success: `true` only after the Telnyx gateway accepts the
+    ///     `decline_push` login.
+    ///   - error: A bounded description when the decline could not be
+    ///     confirmed.
+    func onPushDeclineCompleted(
+        callId: UUID,
+        success: Bool,
+        error: String?
+    )
     
     /// Called when the client's session is updated, typically after a reconnection.
     /// - Parameter sessionId: The new session identifier for the connection.
@@ -83,4 +98,12 @@ public protocol TxClientDelegate: AnyObject {
     /// This is specifically for handling calls that arrive via push notifications
     /// when the app is in the background.
     func onPushCall(call: Call)
+}
+
+public extension TxClientDelegate {
+    func onPushDeclineCompleted(
+        callId: UUID,
+        success: Bool,
+        error: String?
+    ) {}
 }

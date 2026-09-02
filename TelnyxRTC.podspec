@@ -18,5 +18,8 @@ Pod::Spec.new do |spec|
   spec.resource_bundles = {"TelnyxRTC" => ["TelnyxRTC/PrivacyInfo.xcprivacy"]}
 
   spec.dependency  "Starscream", "~> 4.0.8"
-  spec.dependency  "WebRTC-lib", "~> 139.0.0"
+  # Upgraded OS also embeds TelnyxVideoSdk 0.3.7, whose ABI is WebRTC 124.
+  # Keep one WebRTC binary in the host app while carrying the audited
+  # decline acknowledgement fix above the unchanged 4.1.2 media engine.
+  spec.dependency  "WebRTC-lib", "~> 124.0.0"
 end

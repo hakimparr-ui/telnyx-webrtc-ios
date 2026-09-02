@@ -640,30 +640,14 @@ public class TxClient {
             self.socket?.sendMessage(message: vertoLogin.encode())
         }
         
-        if declinePush {
-            // Create a termination reason for local hangup
-            // Use USER_BUSY
-            let terminationReason = CallTerminationReason(
-                cause: ByeMessage.getCauseFromCode(causeCode: CauseCode.USER_BUSY),
-                causeCode: CauseCode.USER_BUSY.rawValue
-            )
-            
-            self.delegate?.onCallStateUpdated(callState: CallState.DONE(reason: terminationReason),
-                                              callId: self.currentCallId)
-            
-            // Disconnect the socket after a 1-second delay as required
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                Logger.log.i(message: "TxClient:: performLogin - Disconnecting socket after decline_push login")
-                // Reset push variables after decline_push login is complete
-                self.resetPushVariables()
-                self.disconnect()
-            }
-        }
     }
 
     /// Disconnects the TxClient from the Telnyx signaling server.
     public func disconnect() {
         Logger.log.i(message: "TxClient:: disconnect()")
+        cleanupPendingCallKitDecline(
+            reason: "client disconnected before decline_push was accepted"
+        )
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
 
@@ -800,13 +784,36 @@ public class TxClient {
     }
 
     private func cleanupPendingCallKitDecline(reason: String) {
-        guard pendingCallDecline || endCallAction != nil else { return }
+        guard pendingCallDecline else { return }
         Logger.log.i(message: "TxClient:: cleanupPendingCallKitDecline - \(reason)")
+        let callId = currentCallId
         resetPushVariables()
+        delegate?.onPushDeclineCompleted(
+            callId: callId,
+            success: false,
+            error: reason
+        )
+    }
+
+    private func confirmPendingCallKitDecline() {
+        guard pendingCallDecline else { return }
+        let callId = currentCallId
+        resetPushVariables()
+        delegate?.onPushDeclineCompleted(
+            callId: callId,
+            success: true,
+            error: nil
+        )
     }
 
     private func failEndCallAction(_ endAction: CXEndCallAction) {
-        resetPushVariables()
+        if pendingCallDecline {
+            cleanupPendingCallKitDecline(
+                reason: "decline_push could not start"
+            )
+        } else {
+            resetPushVariables()
+        }
         endAction.fail()
     }
     
@@ -888,7 +895,8 @@ public class TxClient {
                 do {
                     try connectSocketOnly(serverConfiguration: storedServerConfiguration)
                     // Login with decline_push will happen in onSocketConnected
-                    // Note: resetPushVariables() will be called after decline_push login is sent
+                    // Provider completion is reported only after the gateway
+                    // accepts the decline_push login.
                 } catch let error {
                     Logger.log.e(message: "TxClient:: endCallFromCallkit connect error \(error.localizedDescription)")
                     failEndCallAction(endAction)
@@ -906,11 +914,6 @@ public class TxClient {
                 self.calls.removeValue(forKey: callUUID)
             }
             
-            // Only reset push variables if socket is already connected
-            // If not connected, reset will happen after decline_push login is sent
-            if isConnected() {
-                self.resetPushVariables()
-            }
             self.stopReconnectTimeout()
             endAction.fulfill()
             return
@@ -1091,7 +1094,7 @@ public class TxClient {
     private func updateGatewayState(newState: GatewayStates) {
         Logger.log.i(message: "TxClient:: updateGatewayState() newState [\(newState)] gatewayState [\(self.gatewayState)]")
 
-        if self.gatewayState == .REGED {
+        if self.gatewayState == .REGED && !pendingCallDecline {
             // If the client is already registered, we don't need to do anything else.
             return
         }
@@ -1107,7 +1110,7 @@ public class TxClient {
                 // Handle decline_push case - disconnect immediately after successful login
                 if pendingCallDecline {
                     Logger.log.i(message: "TxClient:: updateGatewayState() decline_push completed, disconnecting")
-                    pendingCallDecline = false
+                    confirmPendingCallKitDecline()
                     self.disconnect()
                     return
                 }
@@ -1138,6 +1141,9 @@ public class TxClient {
                                 self?.requestGatewayState()
                             } else {
                                 let notRegisteredError = TxError.serverError(reason: .gatewayNotRegistered)
+                                self?.cleanupPendingCallKitDecline(
+                                    reason: "decline_push gateway registration timed out"
+                                )
                                 self?.delegate?.onClientError(error: notRegisteredError)
                                 Logger.log.e(message: "TxClient:: updateGatewayState() client not registered")
                             }
@@ -1900,6 +1906,10 @@ extension TxClient : SocketDelegate {
             let message: String = error["message"] as? String ?? "Unknown"
             let codeInt: Int = error["code"] as? Int ?? 0
             let code: String = String(codeInt)
+
+            cleanupPendingCallKitDecline(
+                reason: "decline_push server error \(code): \(message)"
+            )
 
             // Use the existing ServerErrorReason.signalingServerError approach
             let err = TxError.serverError(reason: .signalingServerError(message: message, code: code))
