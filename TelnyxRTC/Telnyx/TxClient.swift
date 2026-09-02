@@ -1135,6 +1135,19 @@ public class TxClient {
         }?.key
     }
 
+    private func pendingActiveCallTerminationCallId(
+        matching callId: UUID
+    ) -> UUID? {
+        if pendingActiveCallTerminations[callId] != nil {
+            return callId
+        }
+        guard let appCallId = call(forSocketCallId: callId)?.callInfo?.callId,
+              pendingActiveCallTerminations[appCallId] != nil else {
+            return nil
+        }
+        return appCallId
+    }
+
     @discardableResult
     private func confirmActiveCallTerminationBye(
         responseId: String,
@@ -2370,7 +2383,7 @@ extension TxClient {
     }
 
     /// To receive INVITE message after Push Noficiation is Received. Send attachCall Command
-    fileprivate func sendAttachCall() {
+    func sendAttachCall() {
         Logger.log.e(message: "TxClient:: PN Recieved.. Sending reattach call ")
         let pushProvider = self.txConfig?.pushNotificationConfig?.pushNotificationProvider
         let attachMessage = AttachCallMessage(pushNotificationProvider: pushProvider,pushEnvironment:self.txConfig?.pushEnvironment)
@@ -2801,9 +2814,19 @@ extension TxClient : SocketDelegate {
                 socket: sourceSocket
             )
             if attachCallId == vertoMessage.id {
+                attachCallId = nil
                 // Call failed from remote end
                 if let callId = pushMetaData?["call_id"] as? String,
                 let callUUID = UUID(uuidString: callId) {
+                  if pendingActiveCallTerminationCallId(
+                    matching: callUUID
+                  ) != nil {
+                    Logger.log.i(
+                      message: "TxClient:: ignoring ATTACH error as active call termination evidence"
+                    )
+                    scheduleActiveCallTerminationRecovery(delay: 0.0)
+                    return
+                  }
                   Logger.log.i(message: "TxClient:: Attach Call ID \(String(describing: callId))")
                   FileLogger.shared.log("Error Recieved, Remote Call Ended Line 764")
                   // Create a termination reason for the error

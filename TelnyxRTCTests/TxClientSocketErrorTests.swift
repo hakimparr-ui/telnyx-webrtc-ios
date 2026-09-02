@@ -269,6 +269,91 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
     }
 
+    func testAttachErrorCannotCompletePendingTerminationBeforeExactBye() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        let appCallId = UUID()
+        let signalingCallId = UUID()
+        try startPushFlow(callId: appCallId)
+        installActiveCall(
+            appCallId: appCallId,
+            signalingCallId: signalingCallId,
+            socket: socket
+        )
+        txClient.sendAttachCall()
+        let attachMessageId = try latestAttachMessageId(in: socket)
+
+        let completed = expectation(description: "exact BYE completed termination")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: appCallId) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+        let authenticationId = try XCTUnwrap(
+            privateString(named: "activeCallTerminationLoginMessageId")
+        )
+
+        socket.emitMessage(attachError(id: attachMessageId))
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(mockDelegate.remoteEndedCallIds.isEmpty)
+        XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: appCallId))
+        XCTAssertNil(privateString(named: "attachCallId"))
+        XCTAssertEqual(
+            privateString(named: "activeCallTerminationLoginMessageId"),
+            authenticationId
+        )
+
+        try completeActiveTerminationAuthentication()
+        let byeMessageId = try latestByeMessageId(in: socket)
+        socket.emitMessage(byeAcknowledgement(id: byeMessageId))
+        wait(for: [completed], timeout: 1.0)
+
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(mockDelegate.remoteEndedCallIds, [appCallId])
+        XCTAssertEqual(mockDelegate.doneCallIds, [appCallId])
+        XCTAssertNil(txClient.getCall(callId: appCallId))
+        XCTAssertTrue(socket.sentMessages.contains { message in
+            isByeMessage(message) &&
+                message.contains(signalingCallId.uuidString.lowercased())
+        })
+    }
+
+    func testAttachErrorRecoveryExhaustionFailsAndRetainsCall() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        txClient.activeCallTerminationMaxReconnectAttempts = 0
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        installActiveCall(
+            appCallId: callId,
+            signalingCallId: callId,
+            socket: socket
+        )
+        txClient.sendAttachCall()
+        let attachMessageId = try latestAttachMessageId(in: socket)
+
+        let completed = expectation(description: "bounded termination failed")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(
+            callId: callId,
+            timeout: 0.03
+        ) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+
+        socket.emitMessage(attachError(id: attachMessageId))
+        socket.emitDisconnected(reconnect: false)
+        wait(for: [completed], timeout: 1.0)
+
+        XCTAssertEqual(results, [false])
+        XCTAssertTrue(mockDelegate.remoteEndedCallIds.isEmpty)
+        XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
+    }
+
     func testActiveTerminationReconnectAttemptsAreBounded() throws {
         let sockets = (0..<4).map { _ in
             ActiveTerminationTestSocket(connectsSuccessfully: false)
@@ -725,6 +810,12 @@ class TxClientPingAuthTests: XCTestCase {
         """
     }
 
+    private func attachError(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","error":{"code":-32000,"message":"ATTACH rejected"}}
+        """
+    }
+
     private func disablePushSuccess(id: String) -> String {
         """
         {"jsonrpc":"2.0","id":"\(id)","result":{"message":"\(DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE)"}}
@@ -779,6 +870,18 @@ class TxClientPingAuthTests: XCTestCase {
 
     private func latestByeMessageId(in socket: ActiveTerminationTestSocket) throws -> String {
         let message = try XCTUnwrap(socket.sentMessages.last(where: isByeMessage))
+        let data = try XCTUnwrap(message.data(using: .utf8))
+        let object = try JSONSerialization.jsonObject(with: data)
+        let dictionary = try XCTUnwrap(object as? [String: Any])
+        return try XCTUnwrap(dictionary["id"] as? String)
+    }
+
+    private func latestAttachMessageId(
+        in socket: ActiveTerminationTestSocket
+    ) throws -> String {
+        let message = try XCTUnwrap(socket.sentMessages.last {
+            $0.contains("telnyx_rtc.attachCalls")
+        })
         let data = try XCTUnwrap(message.data(using: .utf8))
         let object = try JSONSerialization.jsonObject(with: data)
         let dictionary = try XCTUnwrap(object as? [String: Any])
