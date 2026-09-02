@@ -1424,19 +1424,30 @@ extension TxClient {
         }
 
         if isCallFromPush {
+            // A local end always wins over a late provider INVITE. Emitting
+            // onPushCall or answering first can resurrect a call which
+            // CallKit has already removed.
+            if pendingCallDecline || endCallAction != nil {
+                if let answerCallAction, !answerCallAction.isComplete {
+                    answerCallAction.fail()
+                }
+                call.hangup()
+                stopReconnectTimeout()
+                if pendingCallDecline {
+                    cleanupPendingCallKitDecline(
+                        reason: "INVITE arrived before decline_push was accepted"
+                    )
+                } else {
+                    resetPushVariables()
+                }
+                currentCallId = UUID()
+                return
+            }
             self.delegate?.onPushCall(call: call)
             //Answer is pending from push - Answer Call
             if(answerCallAction != nil){
                 call.answer(customHeaders: pendingAnswerHeaders,debug: enableQualityMetrics)
                 answerCallAction?.fulfill()
-                resetPushVariables()
-            }
-            
-            //End is pending from callkit
-            if endCallAction != nil {
-                call.hangup()
-                stopReconnectTimeout()
-                currentCallId = UUID()
                 resetPushVariables()
             }
         } else {
