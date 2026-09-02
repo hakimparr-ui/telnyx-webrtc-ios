@@ -125,6 +125,13 @@ public extension Notification.Name {
 /// }
 /// ```
 public class TxClient {
+    private struct PendingDisablePush {
+        let messageId: String
+        let generation: UInt
+        let socket: Socket
+        var timeoutWorkItem: DispatchWorkItem?
+    }
+
     private struct PendingActiveCallTermination {
         let callId: UUID
         let generation: UInt
@@ -211,6 +218,10 @@ public class TxClient {
     private var activeCallTerminationGatewayMessageId: String?
     private var activeCallTerminationAuthenticationSocket: Socket?
     private var activeCallTerminationAuthenticatedSocket: Socket?
+    private let disablePushLock = NSLock()
+    private var pendingDisablePush: PendingDisablePush?
+    private var disablePushGeneration: UInt = 0
+    internal var disablePushTimeoutInterval: TimeInterval = 10.0
     internal var activeCallTerminationRetryInterval: TimeInterval = 4.0
     internal var activeCallTerminationGatewayPollInterval: TimeInterval = TxClient.DEFAULT_REGISTER_INTERVAL
     internal var activeCallTerminationMaxReconnectAttempts: Int = 3
@@ -575,6 +586,7 @@ public class TxClient {
         } else {
             self.serverConfiguration = serverConfiguration
         }
+        failPendingDisablePushForSocketReplacement()
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -599,6 +611,7 @@ public class TxClient {
                                                          pushMetaData: self.pushMetaData)
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
+        failPendingDisablePushForSocketReplacement()
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -617,6 +630,7 @@ public class TxClient {
         self.serverConfiguration = serverConfiguration
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
+        failPendingDisablePushForSocketReplacement()
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -697,6 +711,11 @@ public class TxClient {
     /// Disconnects the TxClient from the Telnyx signaling server.
     public func disconnect() {
         Logger.log.i(message: "TxClient:: disconnect()")
+        _ = finishPendingDisablePush(
+            socket: socket,
+            success: false,
+            message: "socket disconnected before push notifications were disabled"
+        )
         completeAllActiveCallTerminations(success: false)
         cleanupPendingCallKitDecline(
             reason: "client disconnected before decline_push was accepted"
@@ -1480,25 +1499,218 @@ public class TxClient {
     }
     
     
-    /// To disable push notifications for the current user
+    /// Disables push notifications for the current user.
+    ///
+    /// The delegate is notified only after the exact request is acknowledged on
+    /// the socket that sent it. A newer request supersedes any pending request.
     public func disablePushNotifications() {
-        Logger.log.i(message: "TxClient:: disablePush()")
-        let pushProvider = self.txConfig?.pushNotificationConfig?.pushNotificationProvider
+        let start = { [weak self] in
+            self?.startDisablePushNotifications()
+        }
+        if Thread.isMainThread {
+            start()
+        } else {
+            DispatchQueue.main.async(execute: start)
+        }
+    }
 
-        if let sipUser = self.txConfig?.sipUser {
-            let pushToken = self.txConfig?.pushNotificationConfig?.pushDeviceToken
-            let disablePushMessage = DisablePushMessage(user: sipUser,pushDeviceToken: pushToken,pushNotificationProvider: pushProvider,pushEnvironment: self.txConfig?.pushEnvironment)
-            let message = disablePushMessage.encode() ?? ""
-            self.socket?.sendMessage(message: message)
+    private func startDisablePushNotifications() {
+        Logger.log.i(message: "TxClient:: disablePush()")
+        if let superseded = takePendingDisablePush() {
+            notifyDisablePushCompletion(
+                superseded,
+                success: false,
+                message: "disable push notification request superseded"
+            )
+        }
+
+        guard let config = txConfig else {
+            delegate?.onPushDisabled(
+                success: false,
+                message: "disable push notification configuration unavailable"
+            )
             return
         }
-        
-        if let token = self.txConfig?.token {
-            let pushToken = self.txConfig?.pushNotificationConfig?.pushDeviceToken
-            let disablePushMessage = DisablePushMessage(loginToken:token,pushDeviceToken: pushToken,pushNotificationProvider: pushProvider,pushEnvironment: self.txConfig?.pushEnvironment)
-            let message = disablePushMessage.encode() ?? ""
-            self.socket?.sendMessage(message: message)
+        guard let sourceSocket = socket else {
+            delegate?.onPushDisabled(
+                success: false,
+                message: "disable push notification socket unavailable"
+            )
+            return
         }
+
+        let pushProvider = config.pushNotificationConfig?.pushNotificationProvider
+        let pushToken = config.pushNotificationConfig?.pushDeviceToken
+        let disablePushMessage: DisablePushMessage
+        if let sipUser = config.sipUser {
+            disablePushMessage = DisablePushMessage(
+                user: sipUser,
+                pushDeviceToken: pushToken,
+                pushNotificationProvider: pushProvider,
+                pushEnvironment: config.pushEnvironment
+            )
+        } else if let token = config.token {
+            disablePushMessage = DisablePushMessage(
+                loginToken: token,
+                pushDeviceToken: pushToken,
+                pushNotificationProvider: pushProvider,
+                pushEnvironment: config.pushEnvironment
+            )
+        } else {
+            delegate?.onPushDisabled(
+                success: false,
+                message: "disable push notification credentials unavailable"
+            )
+            return
+        }
+
+        guard let encodedMessage = disablePushMessage.encode() else {
+            delegate?.onPushDisabled(
+                success: false,
+                message: "disable push notification request could not be encoded"
+            )
+            return
+        }
+
+        disablePushGeneration &+= 1
+        let generation = disablePushGeneration
+        let messageId = disablePushMessage.id
+        let timeoutWorkItem = DispatchWorkItem { [weak self, weak sourceSocket] in
+            guard let self, let sourceSocket else { return }
+            _ = self.finishPendingDisablePush(
+                messageId: messageId,
+                socket: sourceSocket,
+                generation: generation,
+                success: false,
+                message: "disable push notification request timed out"
+            )
+        }
+        let pending = PendingDisablePush(
+            messageId: messageId,
+            generation: generation,
+            socket: sourceSocket,
+            timeoutWorkItem: timeoutWorkItem
+        )
+        setPendingDisablePush(pending)
+
+        guard sourceSocket.sendMessage(message: encodedMessage) else {
+            _ = finishPendingDisablePush(
+                messageId: messageId,
+                socket: sourceSocket,
+                generation: generation,
+                success: false,
+                message: "disable push notification request could not be sent"
+            )
+            return
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.0, disablePushTimeoutInterval),
+            execute: timeoutWorkItem
+        )
+    }
+
+    private func setPendingDisablePush(_ pending: PendingDisablePush) {
+        disablePushLock.lock()
+        pendingDisablePush = pending
+        disablePushLock.unlock()
+    }
+
+    private func failPendingDisablePushForSocketReplacement() {
+        guard let sourceSocket = socket else { return }
+        _ = finishPendingDisablePush(
+            socket: sourceSocket,
+            success: false,
+            message: "socket replaced before push notifications were disabled"
+        )
+    }
+
+    private func takePendingDisablePush(
+        messageId: String? = nil,
+        socket expectedSocket: Socket? = nil,
+        generation: UInt? = nil
+    ) -> PendingDisablePush? {
+        disablePushLock.lock()
+        defer { disablePushLock.unlock() }
+        guard let pending = pendingDisablePush else { return nil }
+        if let messageId, pending.messageId != messageId { return nil }
+        if let expectedSocket, pending.socket !== expectedSocket { return nil }
+        if let generation, pending.generation != generation { return nil }
+        pendingDisablePush = nil
+        return pending
+    }
+
+    private func notifyDisablePushCompletion(
+        _ pending: PendingDisablePush,
+        success: Bool,
+        message: String
+    ) {
+        pending.timeoutWorkItem?.cancel()
+        delegate?.onPushDisabled(success: success, message: message)
+    }
+
+    @discardableResult
+    private func finishPendingDisablePush(
+        messageId: String? = nil,
+        socket expectedSocket: Socket? = nil,
+        generation: UInt? = nil,
+        success: Bool,
+        message: String
+    ) -> Bool {
+        guard let pending = takePendingDisablePush(
+            messageId: messageId,
+            socket: expectedSocket,
+            generation: generation
+        ) else {
+            return false
+        }
+        notifyDisablePushCompletion(pending, success: success, message: message)
+        return true
+    }
+
+    private func validDisablePushSuccessMessage(
+        from result: [String: Any]?
+    ) -> String? {
+        guard let result else { return nil }
+        let message = result["message"] as? String
+        if result.keys.contains(DisablePushMessage.SUCCESS_KEY) {
+            let successValue = result[DisablePushMessage.SUCCESS_KEY]
+            let isSuccess = (successValue as? Bool) == true ||
+                (successValue as? String)?.lowercased() == "true" ||
+                (successValue as? String) == DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE
+            return isSuccess ? (message ?? DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE) : nil
+        }
+        guard message == DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE else {
+            return nil
+        }
+        return message
+    }
+
+    @discardableResult
+    private func handleDisablePushResponse(
+        responseId: String,
+        socket responseSocket: Socket,
+        result: [String: Any]?
+    ) -> Bool {
+        disablePushLock.lock()
+        let matchesPending = pendingDisablePush?.messageId == responseId &&
+            pendingDisablePush?.socket === responseSocket
+        disablePushLock.unlock()
+        guard matchesPending else { return false }
+
+        guard let successMessage = validDisablePushSuccessMessage(from: result) else {
+            return finishPendingDisablePush(
+                messageId: responseId,
+                socket: responseSocket,
+                success: false,
+                message: "disable push notification was not confirmed"
+            )
+        }
+        return finishPendingDisablePush(
+            messageId: responseId,
+            socket: responseSocket,
+            success: true,
+            message: successMessage
+        )
     }
 
     /// Get the current session ID after logging into Telnyx Backend.
@@ -1587,6 +1799,7 @@ public class TxClient {
             // Initialize socket and start connection
             self.gatewayState = .NOREG
             self.gatewayRegisteredSocket = nil
+            self.failPendingDisablePushForSocketReplacement()
             self.socket = socketFactory()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
@@ -2453,6 +2666,11 @@ extension TxClient : SocketDelegate {
     }
     
     func onSocketDisconnected(socket sourceSocket: Socket, reconnect: Bool, region: Region?) {
+        _ = finishPendingDisablePush(
+            socket: sourceSocket,
+            success: false,
+            message: "socket disconnected before push notifications were disabled"
+        )
         guard sourceSocket === socket else {
             Logger.log.i(message: "TxClient:: ignoring disconnected callback from obsolete socket")
             return
@@ -2521,6 +2739,11 @@ extension TxClient : SocketDelegate {
     }
 
     func onSocketError(socket sourceSocket: Socket, error: Error) {
+        _ = finishPendingDisablePush(
+            socket: sourceSocket,
+            success: false,
+            message: "socket error before push notifications were disabled"
+        )
         guard sourceSocket === socket else {
             Logger.log.i(message: "TxClient:: ignoring error callback from obsolete socket")
             return
@@ -2565,6 +2788,14 @@ extension TxClient : SocketDelegate {
 
         //Check if server is sending an error code
         if let error = vertoMessage.serverError {
+            let disablePushErrorMessage = error["message"] as? String ??
+                "disable push notification request was rejected"
+            let failedDisablePush = finishPendingDisablePush(
+                messageId: vertoMessage.id,
+                socket: sourceSocket,
+                success: false,
+                message: disablePushErrorMessage
+            )
             let failedActiveCallTerminationBye = failActiveCallTerminationBye(
                 responseId: vertoMessage.id,
                 socket: sourceSocket
@@ -2606,9 +2837,18 @@ extension TxClient : SocketDelegate {
             // Use the existing ServerErrorReason.signalingServerError approach
             let err = TxError.serverError(reason: .signalingServerError(message: message, code: code))
             self.delegate?.onClientError(error: err)
-            if failedActiveCallTerminationBye {
+            if failedDisablePush || failedActiveCallTerminationBye {
                 return
             }
+        }
+
+        if vertoMessage.jsonMessage.keys.contains("result"),
+           handleDisablePushResponse(
+                responseId: vertoMessage.id,
+                socket: sourceSocket,
+                result: vertoMessage.result
+           ) {
+            return
         }
 
         if vertoMessage.jsonMessage.keys.contains("result"),
@@ -2655,16 +2895,6 @@ extension TxClient : SocketDelegate {
                     socket: sourceSocket
                 )
               
-            }
-            
-            //process disable push notification
-            if let disablePushResult = vertoMessage.result {
-                if let message = disablePushResult["message"] as? String {
-                    if(vertoMessage.method == .DISABLE_PUSH){
-                        Logger.log.i(message: "DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE")
-                        self.delegate?.onPushDisabled(success: true, message: message)
-                    }
-                }
             }
             
             //process ICE restart response (updateMedia)

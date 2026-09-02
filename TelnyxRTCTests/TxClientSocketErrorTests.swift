@@ -549,6 +549,137 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
     }
 
+    func testDisablePushRequiresExactSuccessAndCompletesOnce() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        txClient.disablePushNotifications()
+        let messageId = try latestDisablePushMessageId(in: socket)
+        socket.emitMessage(disablePushSuccess(id: "wrong-\(messageId)"))
+        XCTAssertTrue(mockDelegate.pushDisabledResults.isEmpty)
+
+        socket.emitMessage(disablePushSuccess(id: messageId))
+        socket.emitMessage(disablePushSuccess(id: messageId))
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [true])
+        XCTAssertEqual(
+            mockDelegate.pushDisabledResults.first?.message,
+            DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE
+        )
+    }
+
+    func testDisablePushExactServerErrorFailsOnceAndIgnoresLateSuccess() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        txClient.disablePushNotifications()
+        let messageId = try latestDisablePushMessageId(in: socket)
+        socket.emitMessage(disablePushError(id: messageId))
+        socket.emitMessage(disablePushSuccess(id: messageId))
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+        XCTAssertEqual(mockDelegate.pushDisabledResults.first?.message, "disable push rejected")
+    }
+
+    func testDisablePushTimesOutAndIgnoresLateSuccess() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        txClient.disablePushTimeoutInterval = 0.01
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        let timedOut = expectation(description: "disable push timed out")
+        mockDelegate.onPushDisabledHandler = { success, _ in
+            if !success { timedOut.fulfill() }
+        }
+        txClient.disablePushNotifications()
+        let messageId = try latestDisablePushMessageId(in: socket)
+        wait(for: [timedOut], timeout: 1.0)
+        socket.emitMessage(disablePushSuccess(id: messageId))
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+        XCTAssertEqual(
+            mockDelegate.pushDisabledResults.first?.message,
+            "disable push notification request timed out"
+        )
+    }
+
+    func testDisablePushSendFailureReportsFalseExactlyOnce() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        socket.sendsSuccessfully = false
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        txClient.disablePushNotifications()
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+        XCTAssertEqual(
+            mockDelegate.pushDisabledResults.first?.message,
+            "disable push notification request could not be sent"
+        )
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+    }
+
+    func testOldDisablePushResponseCannotSatisfyNewSocketOperation() throws {
+        let oldSocket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        let currentSocket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        var sockets = [oldSocket, currentSocket]
+        txClient.socketFactory = { sockets.removeFirst() }
+        let config = TxConfig(sipUser: "test_user", password: "test_password")
+        try txClient.connect(txConfig: config)
+
+        txClient.disablePushNotifications()
+        let oldMessageId = try latestDisablePushMessageId(in: oldSocket)
+        try txClient.connect(txConfig: config)
+        txClient.disablePushNotifications()
+        let currentMessageId = try latestDisablePushMessageId(in: currentSocket)
+        XCTAssertNotEqual(oldMessageId, currentMessageId)
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+
+        oldSocket.emitMessage(disablePushSuccess(id: oldMessageId))
+        oldSocket.emitMessage(disablePushSuccess(id: currentMessageId))
+        currentSocket.emitMessage(disablePushSuccess(id: oldMessageId))
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+
+        currentSocket.emitMessage(disablePushSuccess(id: currentMessageId))
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false, true])
+    }
+
+    func testDisablePushDisconnectFailsOnceAndIgnoresLateResponse() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        txClient.disablePushNotifications()
+        let messageId = try latestDisablePushMessageId(in: socket)
+        socket.emitDisconnected(reconnect: false)
+        socket.emitMessage(disablePushSuccess(id: messageId))
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+        XCTAssertEqual(
+            mockDelegate.pushDisabledResults.first?.message,
+            "socket disconnected before push notifications were disabled"
+        )
+    }
+
+    func testDisablePushSocketErrorFailsOnceAndIgnoresLateResponse() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+
+        txClient.disablePushNotifications()
+        let messageId = try latestDisablePushMessageId(in: socket)
+        socket.emitError()
+        socket.emitMessage(disablePushSuccess(id: messageId))
+
+        XCTAssertEqual(mockDelegate.pushDisabledResults.map(\.success), [false])
+        XCTAssertEqual(
+            mockDelegate.pushDisabledResults.first?.message,
+            "socket error before push notifications were disabled"
+        )
+    }
+
     private func startPushFlow(callId: UUID) throws {
         let txConfig = TxConfig(sipUser: "test_user", password: "test_password")
         let serverConfig = TxServerConfiguration()
@@ -591,6 +722,18 @@ class TxClientPingAuthTests: XCTestCase {
     private func byeError(id: String) -> String {
         """
         {"jsonrpc":"2.0","id":"\(id)","error":{"code":-32000,"message":"BYE rejected"}}
+        """
+    }
+
+    private func disablePushSuccess(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","result":{"message":"\(DisablePushMessage.DISABLE_PUSH_SUCCESS_MESSAGE)"}}
+        """
+    }
+
+    private func disablePushError(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","error":{"code":-32000,"message":"disable push rejected"}}
         """
     }
 
@@ -642,6 +785,18 @@ class TxClientPingAuthTests: XCTestCase {
         return try XCTUnwrap(dictionary["id"] as? String)
     }
 
+    private func latestDisablePushMessageId(
+        in socket: ActiveTerminationTestSocket
+    ) throws -> String {
+        let message = try XCTUnwrap(socket.sentMessages.last {
+            $0.contains("telnyx_rtc.disable_push_notification")
+        })
+        let data = try XCTUnwrap(message.data(using: .utf8))
+        let object = try JSONSerialization.jsonObject(with: data)
+        let dictionary = try XCTUnwrap(object as? [String: Any])
+        return try XCTUnwrap(dictionary["id"] as? String)
+    }
+
     private func privateString(named name: String) -> String? {
         guard let value = Mirror(reflecting: txClient).children.first(where: {
             $0.label == name
@@ -659,6 +814,7 @@ private final class ActiveTerminationTestSocket: Socket {
     let connectsSuccessfully: Bool
     var sentMessages: [String] = []
     var onConnect: (() -> Void)?
+    var sendsSuccessfully = true
 
     init(connectsSuccessfully: Bool) {
         self.connectsSuccessfully = connectsSuccessfully
@@ -673,7 +829,7 @@ private final class ActiveTerminationTestSocket: Socket {
 
     @discardableResult
     override func sendMessage(message: String?) -> Bool {
-        guard isConnected, let message else { return false }
+        guard sendsSuccessfully, isConnected, let message else { return false }
         sentMessages.append(message)
         return true
     }
@@ -687,9 +843,9 @@ private final class ActiveTerminationTestSocket: Socket {
         delegate?.onSocketConnected(socket: self)
     }
 
-    func emitDisconnected() {
+    func emitDisconnected(reconnect: Bool = true) {
         isConnected = false
-        delegate?.onSocketDisconnected(socket: self, reconnect: true, region: nil)
+        delegate?.onSocketDisconnected(socket: self, reconnect: reconnect, region: nil)
     }
 
     func emitError() {
@@ -729,10 +885,17 @@ class PingTestDelegate: TxClientDelegate {
         let error: String?
     }
 
+    struct PushDisabledResult {
+        let success: Bool
+        let message: String
+    }
+
     var onClientErrorCalled = false
     var doneCallIds: [UUID] = []
     var remoteEndedCallIds: [UUID] = []
     var pushDeclineResults: [PushDeclineResult] = []
+    var pushDisabledResults: [PushDisabledResult] = []
+    var onPushDisabledHandler: ((Bool, String) -> Void)?
 
     func onSocketConnected() {}
     func onSocketDisconnected() {}
@@ -748,7 +911,10 @@ class PingTestDelegate: TxClientDelegate {
     func onRemoteCallEnded(callId: UUID, reason: CallTerminationReason?) {
         remoteEndedCallIds.append(callId)
     }
-    func onPushDisabled(success: Bool, message: String) {}
+    func onPushDisabled(success: Bool, message: String) {
+        pushDisabledResults.append(PushDisabledResult(success: success, message: message))
+        onPushDisabledHandler?(success, message)
+    }
     func onPushCall(call: Call) {}
     func onPushDeclineCompleted(callId: UUID, success: Bool, error: String?) {
         pushDeclineResults.append(
