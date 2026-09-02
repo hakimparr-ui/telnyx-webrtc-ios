@@ -73,7 +73,7 @@ class TxClientPingAuthTests: XCTestCase {
                        "No error should occur — ping should be silently ignored on unauthenticated socket")
     }
 
-    func testDeclinePushDoneUsesEndActionUUIDWhenCallIdIsNotProvided() throws {
+    func testDeclinePushDoesNotEmitDoneBeforeProviderAcknowledgement() throws {
         let callUUID = UUID()
         try startPushFlow(callId: callUUID)
 
@@ -81,7 +81,8 @@ class TxClientPingAuthTests: XCTestCase {
         txClient.endCallFromCallkit(endAction: endAction)
         txClient.onSocketConnected()
 
-        XCTAssertEqual(mockDelegate.doneCallIds, [callUUID])
+        XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertTrue(mockDelegate.pushDeclineResults.isEmpty)
     }
 
     func testPendingDeclineClearsOnSocketErrorBeforeDeclineLogin() throws {
@@ -94,6 +95,62 @@ class TxClientPingAuthTests: XCTestCase {
         txClient.onSocketConnected()
 
         XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.count, 1)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.first?.callId, callUUID)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.first?.success, false)
+    }
+
+    func testClientReadyBeforeLoginAcknowledgementStillCompletesExactDecline() throws {
+        let callUUID = UUID()
+        try startPushFlow(callId: callUUID)
+
+        let endAction = CXEndCallAction(call: callUUID)
+        txClient.endCallFromCallkit(endAction: endAction)
+        txClient.onSocketConnected()
+        let loginId = try XCTUnwrap(privateString(named: "pendingDeclineLoginMessageId"))
+
+        txClient.onMessageReceived(message: clientReadyMessage())
+        XCTAssertTrue(mockDelegate.pushDeclineResults.isEmpty)
+
+        txClient.onMessageReceived(message: loginAcknowledgement(id: loginId))
+        let gatewayId = try XCTUnwrap(privateString(named: "pendingDeclineGatewayMessageId"))
+        txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED", id: gatewayId))
+
+        XCTAssertEqual(mockDelegate.pushDeclineResults.count, 1)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.first?.callId, callUUID)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.first?.success, true)
+    }
+
+    func testStaleGatewayResponseCannotCompleteDecline() throws {
+        let callUUID = UUID()
+        try startPushFlow(callId: callUUID)
+
+        let endAction = CXEndCallAction(call: callUUID)
+        txClient.endCallFromCallkit(endAction: endAction)
+        txClient.onSocketConnected()
+        let loginId = try XCTUnwrap(privateString(named: "pendingDeclineLoginMessageId"))
+
+        txClient.onMessageReceived(message: loginAcknowledgement(id: loginId))
+        txClient.onMessageReceived(message: clientReadyMessage())
+        let gatewayId = try XCTUnwrap(privateString(named: "pendingDeclineGatewayMessageId"))
+
+        txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED", id: "stale-gateway"))
+        XCTAssertTrue(mockDelegate.pushDeclineResults.isEmpty)
+
+        txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED", id: gatewayId))
+        XCTAssertEqual(mockDelegate.pushDeclineResults.count, 1)
+        XCTAssertEqual(mockDelegate.pushDeclineResults.first?.success, true)
+    }
+
+    func testEndFailsPendingAnswerBeforeStartingDecline() throws {
+        let callUUID = UUID()
+        try startPushFlow(callId: callUUID)
+
+        let answerAction = TrackingAnswerCallAction(call: callUUID)
+        txClient.answerFromCallkit(answerAction: answerAction)
+        txClient.endCallFromCallkit(endAction: CXEndCallAction(call: callUUID))
+
+        XCTAssertEqual(answerAction.failCallCount, 1)
     }
 
     func testAnsweredPushInviteTimeoutUsesPushUUIDAndCompletesAnswerAction() throws {
@@ -131,10 +188,34 @@ class TxClientPingAuthTests: XCTestCase {
         )
     }
 
-    private func gatewayStateMessage(state: String) -> String {
+    private func clientReadyMessage() -> String {
         """
-        {"jsonrpc":"2.0","id":"gateway-state","result":{"params":{"state":"\(state)"}}}
+        {"jsonrpc":"2.0","method":"telnyx_rtc.clientReady","params":{}}
         """
+    }
+
+    private func loginAcknowledgement(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","result":{"sessid":"test-session"}}
+        """
+    }
+
+    private func gatewayStateMessage(state: String, id: String = "gateway-state") -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","result":{"params":{"state":"\(state)"}}}
+        """
+    }
+
+    private func privateString(named name: String) -> String? {
+        guard let value = Mirror(reflecting: txClient).children.first(where: {
+            $0.label == name
+        })?.value else {
+            return nil
+        }
+        if let string = value as? String {
+            return string
+        }
+        return Mirror(reflecting: value).children.first?.value as? String
     }
 }
 
@@ -142,17 +223,30 @@ class TxClientPingAuthTests: XCTestCase {
 
 private final class TrackingAnswerCallAction: CXAnswerCallAction {
     private(set) var fulfillCallCount = 0
+    private(set) var failCallCount = 0
 
     override func fulfill() {
         fulfillCallCount += 1
         super.fulfill()
     }
+
+    override func fail() {
+        failCallCount += 1
+        super.fail()
+    }
 }
 
 class PingTestDelegate: TxClientDelegate {
+    struct PushDeclineResult {
+        let callId: UUID
+        let success: Bool
+        let error: String?
+    }
+
     var onClientErrorCalled = false
     var doneCallIds: [UUID] = []
     var remoteEndedCallIds: [UUID] = []
+    var pushDeclineResults: [PushDeclineResult] = []
 
     func onSocketConnected() {}
     func onSocketDisconnected() {}
@@ -170,6 +264,11 @@ class PingTestDelegate: TxClientDelegate {
     }
     func onPushDisabled(success: Bool, message: String) {}
     func onPushCall(call: Call) {}
+    func onPushDeclineCompleted(callId: UUID, success: Bool, error: String?) {
+        pushDeclineResults.append(
+            PushDeclineResult(callId: callId, success: success, error: error)
+        )
+    }
 
     func onClientError(error: Error) {
         onClientErrorCalled = true

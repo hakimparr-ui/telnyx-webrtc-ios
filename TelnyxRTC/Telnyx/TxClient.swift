@@ -182,7 +182,12 @@ public class TxClient {
     private var storedTxConfig: TxConfig?
     private var storedServerConfiguration: TxServerConfiguration?
     private var pendingCallDecline: Bool = false
+    private var pendingDeclineLoginMessageId: String?
+    private var pendingDeclineLoginAccepted: Bool = false
+    private var pendingDeclineClientReadySeen: Bool = false
+    private var pendingDeclineGatewayMessageId: String?
     private var isReconnectPendingForCallKitDecline: Bool = false
+    private var pendingDeclineReconnectGeneration: UInt = 0
     
     // Timeout mechanism for VoIP push calls
     private var inviteTimeoutTimer: Timer?
@@ -612,7 +617,7 @@ public class TxClient {
                                         declinePush: declinePush,
                                         enableMissedCallNotifications: storedConfig.enableMissedCallNotifications,
                                         pushWhenActive: storedConfig.pushWhenActive)
-            self.socket?.sendMessage(message: vertoLogin.encode())
+            sendLoginMessage(vertoLogin, declinePush: declinePush)
         } else {
             Logger.log.i(message: "TxClient:: performLogin with SIP User and Password, declinePush: \(declinePush)")
             guard let sipUser = storedConfig.sipUser else {
@@ -637,9 +642,22 @@ public class TxClient {
                                         declinePush: declinePush,
                                         enableMissedCallNotifications: storedConfig.enableMissedCallNotifications,
                                         pushWhenActive: storedConfig.pushWhenActive)
-            self.socket?.sendMessage(message: vertoLogin.encode())
+            sendLoginMessage(vertoLogin, declinePush: declinePush)
         }
         
+    }
+
+    private func sendLoginMessage(
+        _ loginMessage: LoginMessage,
+        declinePush: Bool
+    ) {
+        if declinePush {
+            pendingDeclineLoginMessageId = loginMessage.id
+            pendingDeclineLoginAccepted = false
+            pendingDeclineClientReadySeen = false
+            pendingDeclineGatewayMessageId = nil
+        }
+        self.socket?.sendMessage(message: loginMessage.encode())
     }
 
     /// Disconnects the TxClient from the Telnyx signaling server.
@@ -776,7 +794,12 @@ public class TxClient {
         storedTxConfig = nil
         storedServerConfiguration = nil
         pendingCallDecline = false
+        pendingDeclineLoginMessageId = nil
+        pendingDeclineLoginAccepted = false
+        pendingDeclineClientReadySeen = false
+        pendingDeclineGatewayMessageId = nil
         isReconnectPendingForCallKitDecline = false
+        pendingDeclineReconnectGeneration &+= 1
         isCallFromPush = false
         pushCallState = .idle
         stopInviteTimeout()
@@ -877,6 +900,8 @@ public class TxClient {
         // Check if the call was initiated by a push notification
         if isCallFromPush {
             Logger.log.i(message: "TxClient:: endCallFromCallkit - Call initiated by push notification, sending decline_push")
+            answerCallAction?.fail()
+            answerCallAction = nil
             self.pendingCallDecline = true
             self.currentCallId = callId ?? endAction.callUUID
 
@@ -1091,8 +1116,21 @@ public class TxClient {
     /// This function check the gateway status updates to determine if the current user has been successfully
     /// registered and can start receiving and/or making calls.
     /// - Parameter newState: The new gateway state received from B2BUA
-    private func updateGatewayState(newState: GatewayStates) {
+    private func updateGatewayState(
+        newState: GatewayStates,
+        responseId: String
+    ) {
         Logger.log.i(message: "TxClient:: updateGatewayState() newState [\(newState)] gatewayState [\(self.gatewayState)]")
+
+        if pendingCallDecline {
+            guard pendingDeclineLoginAccepted,
+                  responseId == pendingDeclineGatewayMessageId else {
+                Logger.log.i(
+                    message: "TxClient:: ignoring gateway state outside the pending decline transaction"
+                )
+                return
+            }
+        }
 
         if self.gatewayState == .REGED && !pendingCallDecline {
             // If the client is already registered, we don't need to do anything else.
@@ -1154,11 +1192,26 @@ public class TxClient {
         }
     }
 
-    private func requestGatewayState() {
+    @discardableResult
+    private func requestGatewayState() -> String {
         let gatewayMessage = GatewayMessage()
         let message = gatewayMessage.encode() ?? ""
+        if pendingCallDecline && pendingDeclineLoginAccepted {
+            pendingDeclineGatewayMessageId = gatewayMessage.id
+        }
         // Request gateway state
         self.socket?.sendMessage(message: message)
+        return gatewayMessage.id
+    }
+
+    private func advancePendingDeclineIfReady() {
+        guard pendingCallDecline,
+              pendingDeclineLoginAccepted,
+              pendingDeclineClientReadySeen,
+              pendingDeclineGatewayMessageId == nil else {
+            return
+        }
+        pendingDeclineGatewayMessageId = requestGatewayState()
     }
 }
 
@@ -1762,9 +1815,7 @@ extension TxClient : SocketDelegate {
                 }
                 return
             } else {
-                Logger.log.i(message: "TxClient:: Socket connected from push - logging in immediately")
-                performLogin(declinePush: false)
-                pushCallState = .loginSent
+                Logger.log.i(message: "TxClient:: Socket connected from push - waiting for CallKit answer or end")
                 return
             }
         }
@@ -1830,10 +1881,21 @@ extension TxClient : SocketDelegate {
     func onSocketDisconnected(reconnect: Bool, region: Region?) {
         if reconnect {
             Logger.log.i(message: "TxClient:: SocketDelegate  Reconnecting")
+            let declineReconnectGeneration: UInt?
             if pendingCallDecline {
                 isReconnectPendingForCallKitDecline = true
+                pendingDeclineReconnectGeneration &+= 1
+                declineReconnectGeneration = pendingDeclineReconnectGeneration
+            } else {
+                declineReconnectGeneration = nil
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + TxClient.RECONNECT_BUFFER) {
+                if let declineReconnectGeneration {
+                    guard self.pendingCallDecline,
+                          self.pendingDeclineReconnectGeneration == declineReconnectGeneration else {
+                        return
+                    }
+                }
                 do {
                     var updatedServerConfig = self.serverConfiguration
 
@@ -1918,9 +1980,13 @@ extension TxClient : SocketDelegate {
             let codeInt: Int = error["code"] as? Int ?? 0
             let code: String = String(codeInt)
 
-            cleanupPendingCallKitDecline(
-                reason: "decline_push server error \(code): \(message)"
-            )
+            if pendingCallDecline &&
+                (vertoMessage.id == pendingDeclineLoginMessageId ||
+                    vertoMessage.id == pendingDeclineGatewayMessageId) {
+                cleanupPendingCallKitDecline(
+                    reason: "decline_push server error \(code): \(message)"
+                )
+            }
 
             // Use the existing ServerErrorReason.signalingServerError approach
             let err = TxError.serverError(reason: .signalingServerError(message: message, code: code))
@@ -1929,6 +1995,11 @@ extension TxClient : SocketDelegate {
 
         //Check if we are getting the new sessionId in response to the "login" message.
         if let result = vertoMessage.result {
+            if pendingCallDecline &&
+                vertoMessage.id == pendingDeclineLoginMessageId {
+                pendingDeclineLoginAccepted = true
+                advancePendingDeclineIfReady()
+            }
             // Process gateway state result.
             if let params = result["params"] as? [String: Any],
                let state = params["state"] as? String,
@@ -1946,7 +2017,10 @@ extension TxClient : SocketDelegate {
                 }
                 self.socket?.voiceSdkId = vertoMessage.voiceSdkId
                 
-                self.updateGatewayState(newState: gatewayState)
+                self.updateGatewayState(
+                    newState: gatewayState,
+                    responseId: vertoMessage.id
+                )
               
             }
             
@@ -1995,7 +2069,12 @@ extension TxClient : SocketDelegate {
                     // Clients can receive or place calls when they are fully registered into the backend.
                     // If a client try to call beforw been registered, a GATEWAY_DOWN error is received.
                     // Therefore, we need to check the gateway state once we have successfully loged in:
-                    self.requestGatewayState()
+                    if pendingCallDecline {
+                        pendingDeclineClientReadySeen = true
+                        advancePendingDeclineIfReady()
+                    } else {
+                        self.requestGatewayState()
+                    }
                     // If we are going to receive an incoming call
                     if let params = vertoMessage.params,
                        let _ = params["reattached_sessions"] {
