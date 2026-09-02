@@ -130,6 +130,8 @@ public class TxClient {
         let generation: UInt
         var completions: [(Bool) -> Void]
         var timeoutWorkItem: DispatchWorkItem?
+        var byeMessageId: String?
+        var byeSocket: Socket?
     }
 
     /// Tracks the internal VoIP push handoff before a real incoming `Call` may exist.
@@ -167,6 +169,7 @@ public class TxClient {
     private var registerRetryCount: Int = MAX_REGISTER_RETRY
     private var registerTimer: Timer = Timer()
     private var gatewayState: GatewayStates = .NOREG
+    private weak var gatewayRegisteredSocket: Socket?
     private var isCallFromPush: Bool = false
     private var currentCallId: UUID = UUID()
     private var pendingAnswerHeaders = [String:String]()
@@ -201,6 +204,7 @@ public class TxClient {
     private var activeCallTerminationReconnectAttempts: Int = 0
     private var isActiveCallTerminationReconnectScheduled: Bool = false
     private var activeCallTerminationAuthenticationGeneration: UInt = 0
+    private var activeCallTerminationGatewayRetryCount: Int = TxClient.MAX_REGISTER_RETRY
     private var activeCallTerminationLoginMessageId: String?
     private var activeCallTerminationLoginAccepted: Bool = false
     private var activeCallTerminationClientReadySeen: Bool = false
@@ -208,6 +212,7 @@ public class TxClient {
     private var activeCallTerminationAuthenticationSocket: Socket?
     private var activeCallTerminationAuthenticatedSocket: Socket?
     internal var activeCallTerminationRetryInterval: TimeInterval = 4.0
+    internal var activeCallTerminationGatewayPollInterval: TimeInterval = TxClient.DEFAULT_REGISTER_INTERVAL
     internal var activeCallTerminationMaxReconnectAttempts: Int = 3
     internal var socketFactory: () -> Socket = { Socket() }
     
@@ -308,7 +313,9 @@ public class TxClient {
     /// Client must be registered in order to receive or place calls.
     public var isRegistered: Bool {
         get {
-            return gatewayState == .REGED
+            gatewayState == .REGED &&
+                socket?.isConnected == true &&
+                gatewayRegisteredSocket === socket
         }
     }
 
@@ -554,6 +561,7 @@ public class TxClient {
         try txConfig.validateParams()
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
+        self.gatewayRegisteredSocket = nil
         self.txConfig = txConfig
 
         if(self.voiceSdkId != nil){
@@ -581,6 +589,7 @@ public class TxClient {
         try txConfig.validateParams()
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
+        self.gatewayRegisteredSocket = nil
         self.txConfig = txConfig
 
 
@@ -601,6 +610,7 @@ public class TxClient {
         Logger.log.i(message: "TxClient:: connectSocketOnly - connecting socket without login")
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
+        self.gatewayRegisteredSocket = nil
         if self.txConfig == nil {
             self.txConfig = storedTxConfig
         }
@@ -693,6 +703,7 @@ public class TxClient {
         )
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
+        self.gatewayRegisteredSocket = nil
 
         // Let's cancell all the current calls
         for (_ ,call) in self.calls {
@@ -730,13 +741,14 @@ public class TxClient {
         return isConnected
     }
 
-    /// Ends an active call after its `BYE` has been queued on the currently authenticated signalling socket.
-    /// If signalling is unavailable, the client performs up to three bounded reconnect and authentication attempts.
+    /// Ends an active call after the exact `BYE` transaction is acknowledged on the
+    /// currently authenticated signalling socket.
+    /// If signalling is unavailable, the client performs up to three bounded recovery attempts.
     /// An exact remote `BYE` received while the request is pending also completes the request successfully.
     /// - Parameters:
     ///   - callId: The app-facing UUID of the call to end.
     ///   - timeout: The maximum time to retain and recover the termination request.
-    ///   - completion: Called exactly once with `true` after the `BYE` is queued or exact remote termination is observed.
+    ///   - completion: Called exactly once with `true` after the exact `BYE` response or exact remote termination is observed.
     public func endCallWhenSignalingReady(
         callId: UUID,
         timeout: TimeInterval = 12.0,
@@ -788,19 +800,15 @@ public class TxClient {
             return
         }
 
-        if gatewayState == .REGED,
-           let currentSocket = socket,
-           currentSocket.isConnected {
-            activeCallTerminationAuthenticatedSocket = currentSocket
-        }
-
         activeCallTerminationGeneration &+= 1
         let generation = activeCallTerminationGeneration
         var pending = PendingActiveCallTermination(
             callId: exactCallId,
             generation: generation,
             completions: [completion],
-            timeoutWorkItem: nil
+            timeoutWorkItem: nil,
+            byeMessageId: nil,
+            byeSocket: nil
         )
         let timeoutWorkItem = DispatchWorkItem { [weak self] in
             self?.timeoutActiveCallTermination(
@@ -810,6 +818,20 @@ public class TxClient {
         }
         pending.timeoutWorkItem = timeoutWorkItem
         pendingActiveCallTerminations[exactCallId] = pending
+        if !isActiveCallTerminationSignalingReady {
+            if isRegistered,
+               let currentSocket = socket,
+               gatewayRegisteredSocket === currentSocket {
+                beginActiveCallTerminationGatewayVerification(on: currentSocket)
+            } else if let currentSocket = socket,
+                      currentSocket.isConnected,
+                      let currentConfig = txConfig ?? storedTxConfig {
+                _ = beginActiveCallTerminationAuthentication(
+                    on: currentSocket,
+                    txConfig: currentConfig
+                )
+            }
+        }
         DispatchQueue.main.asyncAfter(
             deadline: .now() + max(0.0, timeout),
             execute: timeoutWorkItem
@@ -828,21 +850,40 @@ public class TxClient {
         guard !pendingActiveCallTerminations.isEmpty else { return }
         guard gatewayState == .REGED,
               let currentSocket = socket,
+              let currentSessionId = sessionId,
               currentSocket.isConnected,
+              gatewayRegisteredSocket === currentSocket,
               activeCallTerminationAuthenticatedSocket === currentSocket else {
             scheduleActiveCallTerminationRecovery()
             return
         }
 
-        invalidateActiveCallTerminationRecovery(resetAttempts: true)
+        invalidateActiveCallTerminationRecovery(resetAttempts: false)
         for callId in Array(pendingActiveCallTerminations.keys) {
-            guard pendingActiveCallTerminations[callId] != nil,
-                  let call = call(forSocketCallId: callId) else {
+            guard var pending = pendingActiveCallTerminations[callId] else {
                 continue
             }
-            if call.hangup(using: currentSocket) {
-                completeActiveCallTermination(callId: callId, success: true)
+            guard pending.byeMessageId == nil else {
+                continue
             }
+            guard let call = call(forSocketCallId: callId) else {
+                completeActiveCallTermination(callId: callId, success: false)
+                continue
+            }
+            guard let byeMessageId = call.queueHangup(
+                using: currentSocket,
+                sessionId: currentSessionId
+            ) else {
+                clearActiveCallTerminationByeTransactions(sentOn: currentSocket)
+                gatewayState = .NOREG
+                gatewayRegisteredSocket = nil
+                resetActiveCallTerminationAuthentication()
+                scheduleActiveCallTerminationRecovery(delay: 0.0)
+                return
+            }
+            pending.byeMessageId = byeMessageId
+            pending.byeSocket = currentSocket
+            pendingActiveCallTerminations[callId] = pending
         }
     }
 
@@ -916,6 +957,7 @@ public class TxClient {
     private var isActiveCallTerminationSignalingReady: Bool {
         gatewayState == .REGED &&
             socket?.isConnected == true &&
+            gatewayRegisteredSocket === socket &&
             activeCallTerminationAuthenticatedSocket === socket
     }
 
@@ -959,6 +1001,8 @@ public class TxClient {
         }
 
         activeCallTerminationAuthenticationGeneration &+= 1
+        registerTimer.invalidate()
+        activeCallTerminationGatewayRetryCount = TxClient.MAX_REGISTER_RETRY
         activeCallTerminationLoginMessageId = loginMessage.id
         activeCallTerminationLoginAccepted = false
         activeCallTerminationClientReadySeen = false
@@ -966,11 +1010,27 @@ public class TxClient {
         activeCallTerminationAuthenticationSocket = socket
         activeCallTerminationAuthenticatedSocket = nil
         gatewayState = .NOREG
+        gatewayRegisteredSocket = nil
         guard socket.sendMessage(message: loginMessage.encode()) else {
             resetActiveCallTerminationAuthentication()
             return false
         }
         return true
+    }
+
+    private func beginActiveCallTerminationGatewayVerification(on socket: Socket) {
+        activeCallTerminationAuthenticationGeneration &+= 1
+        registerTimer.invalidate()
+        activeCallTerminationGatewayRetryCount = TxClient.MAX_REGISTER_RETRY
+        activeCallTerminationLoginMessageId = nil
+        activeCallTerminationLoginAccepted = true
+        activeCallTerminationClientReadySeen = true
+        activeCallTerminationGatewayMessageId = nil
+        activeCallTerminationAuthenticationSocket = socket
+        activeCallTerminationAuthenticatedSocket = nil
+        gatewayState = .NOREG
+        gatewayRegisteredSocket = nil
+        _ = requestActiveCallTerminationGatewayState(on: socket)
     }
 
     private func advanceActiveCallTerminationAuthenticationIfReady() {
@@ -982,15 +1042,62 @@ public class TxClient {
               authenticationSocket === socket else {
             return
         }
+        _ = requestActiveCallTerminationGatewayState(on: authenticationSocket)
+    }
+
+    @discardableResult
+    private func requestActiveCallTerminationGatewayState(on authenticationSocket: Socket) -> String? {
+        guard !pendingActiveCallTerminations.isEmpty,
+              activeCallTerminationLoginAccepted,
+              activeCallTerminationAuthenticationSocket === authenticationSocket,
+              authenticationSocket === socket else {
+            return nil
+        }
         let gatewayMessage = GatewayMessage()
         activeCallTerminationGatewayMessageId = gatewayMessage.id
         guard authenticationSocket.sendMessage(message: gatewayMessage.encode()) else {
             activeCallTerminationGatewayMessageId = nil
+            return nil
+        }
+        return gatewayMessage.id
+    }
+
+    private func scheduleActiveCallTerminationGatewayPoll() {
+        registerTimer.invalidate()
+        let authenticationGeneration = activeCallTerminationAuthenticationGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  !self.pendingActiveCallTerminations.isEmpty,
+                  self.activeCallTerminationAuthenticationGeneration == authenticationGeneration else {
+                return
+            }
+            self.registerTimer = Timer.scheduledTimer(
+                withTimeInterval: self.activeCallTerminationGatewayPollInterval,
+                repeats: false
+            ) { [weak self] _ in
+                guard let self,
+                      !self.pendingActiveCallTerminations.isEmpty,
+                      self.activeCallTerminationAuthenticationGeneration == authenticationGeneration,
+                      let authenticationSocket = self.activeCallTerminationAuthenticationSocket,
+                      authenticationSocket === self.socket else {
+                    return
+                }
+                self.activeCallTerminationGatewayRetryCount -= 1
+                if self.activeCallTerminationGatewayRetryCount > 0 {
+                    _ = self.requestActiveCallTerminationGatewayState(on: authenticationSocket)
+                } else {
+                    self.resetActiveCallTerminationAuthentication()
+                    self.gatewayState = .NOREG
+                    self.gatewayRegisteredSocket = nil
+                    self.scheduleActiveCallTerminationRecovery(delay: 0.0)
+                }
+            }
         }
     }
 
     private func resetActiveCallTerminationAuthentication() {
         activeCallTerminationAuthenticationGeneration &+= 1
+        registerTimer.invalidate()
         activeCallTerminationLoginMessageId = nil
         activeCallTerminationLoginAccepted = false
         activeCallTerminationClientReadySeen = false
@@ -999,11 +1106,83 @@ public class TxClient {
         activeCallTerminationAuthenticatedSocket = nil
     }
 
+    private func activeCallTerminationCallId(
+        forByeResponseId responseId: String,
+        socket responseSocket: Socket
+    ) -> UUID? {
+        pendingActiveCallTerminations.first { entry in
+            entry.value.byeMessageId == responseId &&
+                entry.value.byeSocket === responseSocket
+        }?.key
+    }
+
+    @discardableResult
+    private func confirmActiveCallTerminationBye(
+        responseId: String,
+        socket responseSocket: Socket
+    ) -> Bool {
+        guard let callId = activeCallTerminationCallId(
+            forByeResponseId: responseId,
+            socket: responseSocket
+        ) else {
+            return false
+        }
+        guard let call = call(forSocketCallId: callId) else {
+            completeActiveCallTermination(callId: callId, success: false)
+            return true
+        }
+        call.confirmQueuedHangup()
+        completeActiveCallTermination(callId: callId, success: true)
+        return true
+    }
+
+    @discardableResult
+    private func failActiveCallTerminationBye(
+        responseId: String,
+        socket responseSocket: Socket
+    ) -> Bool {
+        guard let callId = activeCallTerminationCallId(
+            forByeResponseId: responseId,
+            socket: responseSocket
+        ) else {
+            return false
+        }
+        completeActiveCallTermination(callId: callId, success: false)
+        return true
+    }
+
+    private func clearActiveCallTerminationByeTransactions(sentOn sourceSocket: Socket) {
+        for callId in Array(pendingActiveCallTerminations.keys) {
+            guard var pending = pendingActiveCallTerminations[callId],
+                  pending.byeSocket === sourceSocket else {
+                continue
+            }
+            pending.byeMessageId = nil
+            pending.byeSocket = nil
+            pendingActiveCallTerminations[callId] = pending
+        }
+    }
+
+    private func clearObsoleteActiveCallTerminationByeTransactions(
+        currentSocket: Socket
+    ) {
+        for callId in Array(pendingActiveCallTerminations.keys) {
+            guard var pending = pendingActiveCallTerminations[callId],
+                  pending.byeSocket != nil,
+                  pending.byeSocket !== currentSocket else {
+                continue
+            }
+            pending.byeMessageId = nil
+            pending.byeSocket = nil
+            pendingActiveCallTerminations[callId] = pending
+        }
+    }
+
     private func completeActiveCallTermination(callId: UUID, success: Bool) {
         let exactCallId: UUID
         if pendingActiveCallTerminations[callId] != nil {
             exactCallId = callId
-        } else if let appCallId = socketToAppCallId[callId],
+        } else if let appCallId = call(forSocketCallId: callId)?.callInfo?.callId,
                   pendingActiveCallTerminations[appCallId] != nil {
             exactCallId = appCallId
         } else {
@@ -1406,6 +1585,8 @@ public class TxClient {
             Logger.log.i(message: "TxClient:: anonymousLogin() serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
             
             // Initialize socket and start connection
+            self.gatewayState = .NOREG
+            self.gatewayRegisteredSocket = nil
             self.socket = socketFactory()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
@@ -1460,8 +1641,13 @@ public class TxClient {
     /// - Parameter newState: The new gateway state received from B2BUA
     private func updateGatewayState(
         newState: GatewayStates,
-        responseId: String
+        responseId: String,
+        socket responseSocket: Socket
     ) {
+        guard responseSocket === socket else {
+            Logger.log.i(message: "TxClient:: ignoring gateway state from obsolete socket")
+            return
+        }
         Logger.log.i(message: "TxClient:: updateGatewayState() newState [\(newState)] gatewayState [\(self.gatewayState)]")
 
         if pendingCallDecline {
@@ -1492,6 +1678,7 @@ public class TxClient {
         }
         // Keep the new state.
         self.gatewayState = newState
+        self.gatewayRegisteredSocket = newState == .REGED ? responseSocket : nil
         switch newState {
             case .REGED:
                 // If the client is now registered:
@@ -1535,6 +1722,10 @@ public class TxClient {
                 }
                 break
             default:
+                if !pendingActiveCallTerminations.isEmpty {
+                    scheduleActiveCallTerminationGatewayPoll()
+                    break
+                }
                 // The gateway state can transition through multiple states before changing to REGED (Registered).
                 self.registerTimer.invalidate()
                 DispatchQueue.main.async {
@@ -1603,13 +1794,11 @@ extension TxClient {
         return call(forSocketCallId: callId)
     }
 
-    /// Looks up a Call by socket callID. First checks direct lookup (for non-push calls
-    /// where socket callID == app-facing callID). If not found, checks the reverse mapping
-    /// for push calls where they differ.
+    /// Looks up a Call by either its app-facing UUID or signaling UUID.
     private func call(forSocketCallId socketCallId: UUID) -> Call? {
         if let call = calls[socketCallId] { return call }
         if let appId = socketToAppCallId[socketCallId] { return calls[appId] }
-        return nil
+        return calls.values.first { $0.signalingCallId == socketCallId }
     }
 
     /// Creates a new Call and starts the call sequence, negotiate the ICE Candidates and sends the invite.
@@ -2162,7 +2351,12 @@ extension TxClient : SocketDelegate {
     }
     
   
-    func onSocketConnected() {
+    func onSocketConnected(socket sourceSocket: Socket) {
+        guard sourceSocket === socket else {
+            Logger.log.i(message: "TxClient:: ignoring connected callback from obsolete socket")
+            return
+        }
+        clearObsoleteActiveCallTerminationByeTransactions(currentSocket: sourceSocket)
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected()")
         isReconnectPendingForCallKitDecline = false
         self.delegate?.onSocketConnected()
@@ -2192,6 +2386,7 @@ extension TxClient : SocketDelegate {
         if !pendingActiveCallTerminations.isEmpty,
            let currentSocket = socket,
            let currentConfig = txConfig ?? storedTxConfig {
+            clearActiveCallTerminationByeTransactions(sentOn: currentSocket)
             _ = beginActiveCallTerminationAuthentication(
                 on: currentSocket,
                 txConfig: currentConfig
@@ -2257,9 +2452,15 @@ extension TxClient : SocketDelegate {
         }
     }
     
-    func onSocketDisconnected(reconnect: Bool, region: Region?) {
+    func onSocketDisconnected(socket sourceSocket: Socket, reconnect: Bool, region: Region?) {
+        guard sourceSocket === socket else {
+            Logger.log.i(message: "TxClient:: ignoring disconnected callback from obsolete socket")
+            return
+        }
         if !pendingActiveCallTerminations.isEmpty {
+            clearActiveCallTerminationByeTransactions(sentOn: sourceSocket)
             gatewayState = .NOREG
+            gatewayRegisteredSocket = nil
             resetActiveCallTerminationAuthentication()
             scheduleActiveCallTerminationRecovery()
             delegate?.onSocketDisconnected()
@@ -2319,10 +2520,16 @@ extension TxClient : SocketDelegate {
         self.delegate?.onSocketDisconnected()
     }
 
-    func onSocketError(error: Error) {
+    func onSocketError(socket sourceSocket: Socket, error: Error) {
+        guard sourceSocket === socket else {
+            Logger.log.i(message: "TxClient:: ignoring error callback from obsolete socket")
+            return
+        }
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketError()")
         if !pendingActiveCallTerminations.isEmpty {
+            clearActiveCallTerminationByeTransactions(sentOn: sourceSocket)
             gatewayState = .NOREG
+            gatewayRegisteredSocket = nil
             resetActiveCallTerminationAuthentication()
             scheduleActiveCallTerminationRecovery()
         }
@@ -2337,7 +2544,11 @@ extension TxClient : SocketDelegate {
      Each time we receive a message throught  the WSS this method will be called.
      Here we are checking the mesaging
      */
-    func onMessageReceived(message: String) {
+    func onMessageReceived(socket sourceSocket: Socket, message: String) {
+        guard sourceSocket === socket else {
+            Logger.log.i(message: "TxClient:: ignoring message callback from obsolete socket")
+            return
+        }
         Logger.log.i(message: "TxClient:: SocketDelegate onMessageReceived() message: \(message)")
         
         // Post notification for websocket message capture
@@ -2354,6 +2565,10 @@ extension TxClient : SocketDelegate {
 
         //Check if server is sending an error code
         if let error = vertoMessage.serverError {
+            let failedActiveCallTerminationBye = failActiveCallTerminationBye(
+                responseId: vertoMessage.id,
+                socket: sourceSocket
+            )
             if attachCallId == vertoMessage.id {
                 // Call failed from remote end
                 if let callId = pushMetaData?["call_id"] as? String,
@@ -2384,12 +2599,24 @@ extension TxClient : SocketDelegate {
                     vertoMessage.id == activeCallTerminationGatewayMessageId) {
                 resetActiveCallTerminationAuthentication()
                 gatewayState = .NOREG
+                gatewayRegisteredSocket = nil
                 scheduleActiveCallTerminationRecovery(delay: 0.0)
             }
 
             // Use the existing ServerErrorReason.signalingServerError approach
             let err = TxError.serverError(reason: .signalingServerError(message: message, code: code))
             self.delegate?.onClientError(error: err)
+            if failedActiveCallTerminationBye {
+                return
+            }
+        }
+
+        if vertoMessage.jsonMessage.keys.contains("result"),
+           confirmActiveCallTerminationBye(
+                responseId: vertoMessage.id,
+                socket: sourceSocket
+           ) {
+            return
         }
 
         //Check if we are getting the new sessionId in response to the "login" message.
@@ -2400,7 +2627,8 @@ extension TxClient : SocketDelegate {
                 advancePendingDeclineIfReady()
             }
             if !pendingActiveCallTerminations.isEmpty &&
-                vertoMessage.id == activeCallTerminationLoginMessageId {
+                vertoMessage.id == activeCallTerminationLoginMessageId &&
+                activeCallTerminationAuthenticationSocket === sourceSocket {
                 activeCallTerminationLoginAccepted = true
                 advanceActiveCallTerminationAuthenticationIfReady()
             }
@@ -2423,7 +2651,8 @@ extension TxClient : SocketDelegate {
                 
                 self.updateGatewayState(
                     newState: gatewayState,
-                    responseId: vertoMessage.id
+                    responseId: vertoMessage.id,
+                    socket: sourceSocket
                 )
               
             }
@@ -2476,7 +2705,8 @@ extension TxClient : SocketDelegate {
                     if pendingCallDecline {
                         pendingDeclineClientReadySeen = true
                         advancePendingDeclineIfReady()
-                    } else if !pendingActiveCallTerminations.isEmpty {
+                    } else if !pendingActiveCallTerminations.isEmpty,
+                              activeCallTerminationAuthenticationSocket === sourceSocket {
                         activeCallTerminationClientReadySeen = true
                         advanceActiveCallTerminationAuthenticationIfReady()
                     } else {
@@ -2615,6 +2845,26 @@ extension TxClient : SocketDelegate {
                     break
             }
         }
+    }
+
+    internal func onSocketConnected() {
+        guard let socket else { return }
+        onSocketConnected(socket: socket)
+    }
+
+    internal func onSocketDisconnected(reconnect: Bool, region: Region?) {
+        guard let socket else { return }
+        onSocketDisconnected(socket: socket, reconnect: reconnect, region: region)
+    }
+
+    internal func onSocketError(error: Error) {
+        guard let socket else { return }
+        onSocketError(socket: socket, error: error)
+    }
+
+    internal func onMessageReceived(message: String) {
+        guard let socket else { return }
+        onMessageReceived(socket: socket, message: message)
     }
 }
 

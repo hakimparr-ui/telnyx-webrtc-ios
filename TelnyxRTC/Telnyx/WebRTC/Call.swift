@@ -802,21 +802,32 @@ extension Call {
         self.endCall(terminationReason: terminationReason)
     }
 
+    /// Queues a BYE on the supplied signaling socket without ending the call locally.
+    /// The caller must retain this `Call` and invoke `confirmQueuedHangup()` only after
+    /// receiving the exact JSON-RPC response for the returned message identifier.
     @discardableResult
-    internal func hangup(using signalingSocket: Socket) -> Bool {
-        guard let sessionId = self.sessionId else { return false }
-        let (causeCode, terminationReason) = localTerminationDetails()
+    internal func queueHangup(
+        using signalingSocket: Socket,
+        sessionId: String
+    ) -> String? {
+        let (causeCode, _) = localTerminationDetails()
         let byeMessage = ByeMessage(
             sessionId: sessionId,
             callId: signalingCallId.uuidString,
             causeCode: causeCode
         )
         guard signalingSocket.sendMessage(message: byeMessage.encode()) else {
-            return false
+            return nil
         }
         self.socket = signalingSocket
+        return byeMessage.id
+    }
+
+    /// Completes local teardown after the queued BYE has been acknowledged by the
+    /// signaling server. Remote BYE handling remains an independent terminal path.
+    internal func confirmQueuedHangup() {
+        let (_, terminationReason) = localTerminationDetails()
         self.endCall(terminationReason: terminationReason)
-        return true
     }
 
     private func localTerminationDetails() -> (CauseCode, CallTerminationReason) {

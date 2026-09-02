@@ -430,7 +430,7 @@ class MockSocketDelegateForRegionTesting: SocketDelegate {
     var lastErrorValue: Error?
     var lastMessage: String?
     
-    func onSocketConnected() {
+    func onSocketConnected(socket: Socket) {
         onSocketConnectedCalled = true
     }
     
@@ -439,18 +439,24 @@ class MockSocketDelegateForRegionTesting: SocketDelegate {
         lastReconnectValue = reconnect
     }
     
+    func onSocketDisconnected(socket: Socket, reconnect: Bool, region: Region?) {
+        onSocketDisconnectedCalled = true
+        lastReconnectValue = reconnect
+        lastRegionValue = region
+    }
+
     func onSocketDisconnected(reconnect: Bool, region: Region?) {
         onSocketDisconnectedCalled = true
         lastReconnectValue = reconnect
         lastRegionValue = region
     }
     
-    func onSocketError(error: Error) {
+    func onSocketError(socket: Socket, error: Error) {
         onSocketErrorCalled = true
         lastErrorValue = error
     }
     
-    func onMessageReceived(message: String) {
+    func onMessageReceived(socket: Socket, message: String) {
         onMessageReceivedCalled = true
         lastMessage = message
     }

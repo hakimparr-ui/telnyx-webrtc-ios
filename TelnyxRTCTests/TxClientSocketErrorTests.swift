@@ -173,7 +173,7 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(answerAction.fulfillCallCount, 1)
     }
 
-    func testActiveTerminationWaitsForRegistrationAndUsesCurrentSocket() throws {
+    func testActiveTerminationWaitsForRegistrationUsesCurrentSocketAndRequiresExactByeResponse() throws {
         let staleSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
         let currentSocket = ActiveTerminationTestSocket(connectsSuccessfully: true)
         var sockets = [staleSocket, currentSocket]
@@ -201,12 +201,19 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertTrue(staleSocket.sentMessages.isEmpty)
         txClient.onSocketConnected()
         try completeActiveTerminationAuthentication()
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: appCallId))
+        let byeMessageId = try latestByeMessageId(in: currentSocket)
+        currentSocket.emitMessage(byeAcknowledgement(id: byeMessageId))
         wait(for: [completed], timeout: 1.0)
 
         XCTAssertEqual(results, [true])
+        XCTAssertNil(txClient.getCall(callId: appCallId))
         XCTAssertFalse(staleSocket.sentMessages.contains(where: isByeMessage))
         XCTAssertTrue(currentSocket.sentMessages.contains { message in
-            isByeMessage(message) && message.contains(signalingCallId.uuidString.lowercased())
+            isByeMessage(message) &&
+                message.contains(signalingCallId.uuidString.lowercased()) &&
+                message.contains("\"sessId\":\"test-session\"")
         })
     }
 
@@ -224,6 +231,8 @@ class TxClientPingAuthTests: XCTestCase {
             results.append(success)
             completed.fulfill()
         }
+        XCTAssertNotNil(privateString(named: "activeCallTerminationLoginMessageId"))
+        XCTAssertTrue(socket.sentMessages.contains { $0.contains("telnyx_rtc.login") })
         txClient.onSocketConnected()
         wait(for: [completed], timeout: 1.0)
 
@@ -233,7 +242,7 @@ class TxClientPingAuthTests: XCTestCase {
     }
 
     func testRemoteByeCompletesPendingActiveTerminationExactlyOnce() throws {
-        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
         txClient.socketFactory = { socket }
         txClient.activeCallTerminationMaxReconnectAttempts = 0
         try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
@@ -256,6 +265,7 @@ class TxClientPingAuthTests: XCTestCase {
         txClient.onMessageReceived(message: remoteByeMessage(callId: signalingCallId))
 
         XCTAssertEqual(results, [true])
+        XCTAssertNil(txClient.getCall(callId: appCallId))
         XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
     }
 
@@ -320,6 +330,9 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
 
         txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED", id: currentGatewayId))
+        XCTAssertTrue(results.isEmpty)
+        let byeMessageId = try latestByeMessageId(in: socket)
+        txClient.onMessageReceived(message: byeAcknowledgement(id: byeMessageId))
         wait(for: [completed], timeout: 1.0)
         XCTAssertEqual(results, [true])
         XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
@@ -347,9 +360,192 @@ class TxClientPingAuthTests: XCTestCase {
 
         txClient.onSocketConnected()
         try completeActiveTerminationAuthentication()
+        let byeMessageId = try latestByeMessageId(in: socket)
+        txClient.onMessageReceived(message: byeAcknowledgement(id: "stale-\(byeMessageId)"))
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        txClient.onMessageReceived(message: byeAcknowledgement(id: byeMessageId))
         wait(for: [completed], timeout: 1.0)
+        txClient.onMessageReceived(message: byeAcknowledgement(id: byeMessageId))
 
         XCTAssertEqual(results, [true, true])
+        XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
+    }
+
+    func testExactByeServerErrorFailsTerminationAndRetainsCall() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        txClient.activeCallTerminationRetryInterval = 1.0
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        installActiveCall(appCallId: callId, signalingCallId: callId, socket: socket)
+
+        let completed = expectation(description: "exact BYE error reported")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: callId) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+
+        socket.emitConnected()
+        try completeActiveTerminationAuthentication()
+        let byeMessageId = try latestByeMessageId(in: socket)
+        socket.emitMessage(byeError(id: byeMessageId))
+        wait(for: [completed], timeout: 1.0)
+        socket.emitMessage(byeAcknowledgement(id: byeMessageId))
+
+        XCTAssertEqual(results, [false])
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
+    }
+
+    func testQueuedByeWithoutResponseTimesOutAndIgnoresLateAcknowledgement() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        txClient.activeCallTerminationRetryInterval = 1.0
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        installActiveCall(appCallId: callId, signalingCallId: callId, socket: socket)
+
+        let completed = expectation(description: "unacknowledged BYE timed out")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: callId, timeout: 0.1) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+
+        socket.emitConnected()
+        try completeActiveTerminationAuthentication()
+        let byeMessageId = try latestByeMessageId(in: socket)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        wait(for: [completed], timeout: 1.0)
+        socket.emitMessage(byeAcknowledgement(id: byeMessageId))
+
+        XCTAssertEqual(results, [false])
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+    }
+
+    func testObsoleteSocketCallbacksCannotAffectCurrentTerminationTransaction() throws {
+        let obsoleteSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let currentSocket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        var sockets = [obsoleteSocket, currentSocket]
+        txClient.socketFactory = { sockets.removeFirst() }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        installActiveCall(appCallId: callId, signalingCallId: callId, socket: obsoleteSocket)
+
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        obsoleteSocket.emitConnected()
+        obsoleteSocket.emitMessage(gatewayStateMessage(state: "REGED"))
+        obsoleteSocket.emitDisconnected()
+        obsoleteSocket.emitError()
+        XCTAssertFalse(txClient.isRegistered)
+
+        let completed = expectation(description: "current socket completed termination")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: callId) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+        XCTAssertFalse(currentSocket.sentMessages.contains(where: isByeMessage))
+
+        currentSocket.emitConnected()
+        let loginId = try XCTUnwrap(privateString(named: "activeCallTerminationLoginMessageId"))
+        obsoleteSocket.emitConnected()
+        obsoleteSocket.emitMessage(loginAcknowledgement(id: loginId))
+        obsoleteSocket.emitDisconnected()
+        obsoleteSocket.emitError()
+        XCTAssertEqual(privateString(named: "activeCallTerminationLoginMessageId"), loginId)
+
+        currentSocket.emitMessage(loginAcknowledgement(id: loginId))
+        obsoleteSocket.emitMessage(clientReadyMessage())
+        currentSocket.emitMessage(clientReadyMessage())
+        let gatewayId = try XCTUnwrap(privateString(named: "activeCallTerminationGatewayMessageId"))
+        obsoleteSocket.emitMessage(gatewayStateMessage(state: "REGED", id: gatewayId))
+        obsoleteSocket.emitDisconnected()
+        obsoleteSocket.emitError()
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(currentSocket.sentMessages.contains(where: isByeMessage))
+
+        currentSocket.emitMessage(gatewayStateMessage(state: "REGED", id: gatewayId))
+        let byeMessageId = try latestByeMessageId(in: currentSocket)
+        obsoleteSocket.emitMessage(byeAcknowledgement(id: byeMessageId))
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        currentSocket.emitMessage(byeAcknowledgement(id: byeMessageId))
+        wait(for: [completed], timeout: 1.0)
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(currentSocket.sentMessages.filter(isByeMessage).count, 1)
+    }
+
+    func testActiveTerminationPollsExactGatewayIdAfterTransitionalState() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        txClient.activeCallTerminationGatewayPollInterval = 0.01
+        txClient.activeCallTerminationRetryInterval = 1.0
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        installActiveCall(appCallId: callId, signalingCallId: callId, socket: socket)
+
+        let completed = expectation(description: "transitional gateway reached REGED")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: callId) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+        socket.emitConnected()
+        let loginId = try XCTUnwrap(privateString(named: "activeCallTerminationLoginMessageId"))
+        socket.emitMessage(loginAcknowledgement(id: loginId))
+        socket.emitMessage(clientReadyMessage())
+        let transitionalGatewayId = try XCTUnwrap(privateString(named: "activeCallTerminationGatewayMessageId"))
+        socket.emitMessage(gatewayStateMessage(state: "NOREG", id: transitionalGatewayId))
+
+        let polled = expectation(description: "exact gateway poll issued")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            polled.fulfill()
+        }
+        wait(for: [polled], timeout: 1.0)
+        let registeredGatewayId = try XCTUnwrap(privateString(named: "activeCallTerminationGatewayMessageId"))
+        XCTAssertNotEqual(transitionalGatewayId, registeredGatewayId)
+        XCTAssertTrue(results.isEmpty)
+
+        socket.emitMessage(gatewayStateMessage(state: "REGED", id: registeredGatewayId))
+        XCTAssertTrue(results.isEmpty)
+        let byeMessageId = try latestByeMessageId(in: socket)
+        socket.emitMessage(byeAcknowledgement(id: byeMessageId))
+        wait(for: [completed], timeout: 1.0)
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
+    }
+
+    func testActiveTerminationReverifiesCurrentRegisteredSocketBeforeBye() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        installActiveCall(appCallId: callId, signalingCallId: callId, socket: socket)
+        socket.emitMessage(gatewayStateMessage(state: "REGED", id: "normal-registration"))
+        XCTAssertTrue(txClient.isRegistered)
+
+        let completed = expectation(description: "registered socket reverified")
+        var results: [Bool] = []
+        txClient.endCallWhenSignalingReady(callId: callId) { success in
+            results.append(success)
+            completed.fulfill()
+        }
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
+
+        let verificationId = try XCTUnwrap(privateString(named: "activeCallTerminationGatewayMessageId"))
+        XCTAssertNotEqual(verificationId, "normal-registration")
+        socket.emitMessage(gatewayStateMessage(state: "REGED", id: verificationId))
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        let byeMessageId = try latestByeMessageId(in: socket)
+        socket.emitMessage(byeAcknowledgement(id: byeMessageId))
+        wait(for: [completed], timeout: 1.0)
+        XCTAssertEqual(results, [true])
         XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
     }
 
@@ -383,6 +579,18 @@ class TxClientPingAuthTests: XCTestCase {
     private func gatewayStateMessage(state: String, id: String = "gateway-state") -> String {
         """
         {"jsonrpc":"2.0","id":"\(id)","result":{"params":{"state":"\(state)"}}}
+        """
+    }
+
+    private func byeAcknowledgement(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","result":{}}
+        """
+    }
+
+    private func byeError(id: String) -> String {
+        """
+        {"jsonrpc":"2.0","id":"\(id)","error":{"code":-32000,"message":"BYE rejected"}}
         """
     }
 
@@ -426,6 +634,14 @@ class TxClientPingAuthTests: XCTestCase {
         message.contains("telnyx_rtc.bye")
     }
 
+    private func latestByeMessageId(in socket: ActiveTerminationTestSocket) throws -> String {
+        let message = try XCTUnwrap(socket.sentMessages.last(where: isByeMessage))
+        let data = try XCTUnwrap(message.data(using: .utf8))
+        let object = try JSONSerialization.jsonObject(with: data)
+        let dictionary = try XCTUnwrap(object as? [String: Any])
+        return try XCTUnwrap(dictionary["id"] as? String)
+    }
+
     private func privateString(named name: String) -> String? {
         guard let value = Mirror(reflecting: txClient).children.first(where: {
             $0.label == name
@@ -464,6 +680,28 @@ private final class ActiveTerminationTestSocket: Socket {
 
     override func disconnect(reconnect: Bool) {
         isConnected = false
+    }
+
+    func emitConnected() {
+        isConnected = true
+        delegate?.onSocketConnected(socket: self)
+    }
+
+    func emitDisconnected() {
+        isConnected = false
+        delegate?.onSocketDisconnected(socket: self, reconnect: true, region: nil)
+    }
+
+    func emitError() {
+        isConnected = false
+        delegate?.onSocketError(
+            socket: self,
+            error: NSError(domain: "ActiveTerminationTestSocket", code: 1)
+        )
+    }
+
+    func emitMessage(_ message: String) {
+        delegate?.onMessageReceived(socket: self, message: message)
     }
 }
 

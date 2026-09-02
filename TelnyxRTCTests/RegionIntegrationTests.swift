@@ -285,28 +285,31 @@ class MockSocket: Socket {
     override func connect(signalingServer: URL) {
         self.mockSignalingServer = signalingServer
         self.mockIsConnected = true
-        self.mockDelegate?.onSocketConnected()
+        self.mockDelegate?.onSocketConnected(socket: self)
     }
     
     override func disconnect(reconnect: Bool) {
         self.mockIsConnected = false
-        self.mockDelegate?.onSocketDisconnected(reconnect: reconnect, region: nil)
+        self.mockDelegate?.onSocketDisconnected(socket: self, reconnect: reconnect, region: nil)
     }
     
-    override func sendMessage(message: String?) {
-        sentMessages.append(message!)
+    @discardableResult
+    override func sendMessage(message: String?) -> Bool {
+        guard let message else { return false }
+        sentMessages.append(message)
+        return true
     }
     
     // Simulate connection error for testing
     func simulateError(_ error: Error) {
         self.mockIsConnected = false
-        self.mockDelegate?.onSocketError(error: error)
+        self.mockDelegate?.onSocketError(socket: self, error: error)
     }
     
     // Simulate region fallback scenario
     func simulateRegionFallback() {
         if let server = mockSignalingServer, shouldFallbackToAuto(signalingServer: server) {
-            self.mockDelegate?.onSocketDisconnected(reconnect: true, region: .auto)
+            self.mockDelegate?.onSocketDisconnected(socket: self, reconnect: true, region: .auto)
         }
     }
 }
@@ -323,7 +326,7 @@ class MockRegionSocketDelegate: SocketDelegate {
     var lastErrorValue: Error?
     var lastMessage: String?
     
-    func onSocketConnected() {
+    func onSocketConnected(socket: Socket) {
         onSocketConnectedCalled = true
     }
     
@@ -332,18 +335,24 @@ class MockRegionSocketDelegate: SocketDelegate {
         lastReconnectValue = reconnect
     }
     
+    func onSocketDisconnected(socket: Socket, reconnect: Bool, region: Region?) {
+        onSocketDisconnectedCalled = true
+        lastReconnectValue = reconnect
+        lastRegionValue = region
+    }
+
     func onSocketDisconnected(reconnect: Bool, region: Region?) {
         onSocketDisconnectedCalled = true
         lastReconnectValue = reconnect
         lastRegionValue = region
     }
     
-    func onSocketError(error: Error) {
+    func onSocketError(socket: Socket, error: Error) {
         onSocketErrorCalled = true
         lastErrorValue = error
     }
     
-    func onMessageReceived(message: String) {
+    func onMessageReceived(socket: Socket, message: String) {
         onMessageReceivedCalled = true
         lastMessage = message
     }

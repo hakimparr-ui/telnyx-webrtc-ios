@@ -135,7 +135,7 @@ extension Socket : WebSocketDelegate {
             // Connection successful - cancel timeout timer
             cancelConnectionTimeout()
             isConnected = true
-            self.delegate?.onSocketConnected()
+            self.delegate?.onSocketConnected(socket: self)
             Logger.log.i(message: "Socket:: websocket is connected: \(headers)")
             break;
             
@@ -148,13 +148,13 @@ extension Socket : WebSocketDelegate {
                 Logger.log.i(message: "Socket:: websocket disconnected after connection timeout: \(reason) with code: \(code)")
                 break
             }
-            self.delegate?.onSocketDisconnected(reconnect: self.reconnect,region: nil)
+            self.delegate?.onSocketDisconnected(socket: self, reconnect: self.reconnect, region: nil)
             Logger.log.i(message: "Socket:: websocket is disconnected: \(reason) with code: \(code)")
             break;
             
         case .text(let message):
             Logger.log.verto(message: "\(message)", direction: .inbound)
-            self.delegate?.onMessageReceived(message: message)
+            self.delegate?.onMessageReceived(socket: self, message: message)
             break;
 
         case .cancelled:
@@ -165,7 +165,7 @@ extension Socket : WebSocketDelegate {
                 Logger.log.i(message: "Socket:: WebSocketDelegate .cancelled after connection timeout")
                 break
             }
-            self.delegate?.onSocketDisconnected(reconnect: self.reconnect,region: nil)
+            self.delegate?.onSocketDisconnected(socket: self, reconnect: self.reconnect, region: nil)
             self.reconnect = false
             Logger.log.i(message: "Socket:: WebSocketDelegate .cancelled")
             break
@@ -184,9 +184,9 @@ extension Socket : WebSocketDelegate {
             }
             if(shouldFallbackToAuto(signalingServer: self.signalingServer)) {
                 Logger.log.i(message: "Socket:: Triggering fallback to auto region due to error: \(error)")
-                self.delegate?.onSocketDisconnected(reconnect: true,region: .auto)
+                self.delegate?.onSocketDisconnected(socket: self, reconnect: true, region: .auto)
             }
-            self.delegate?.onSocketError(error: error)
+            self.delegate?.onSocketError(socket: self, error: error)
             Logger.log.e(message: "Socket:: WebSocketDelegate .error \(error)")
             break;
             
@@ -254,7 +254,7 @@ extension Socket : WebSocketDelegate {
         
         let reconnectRegion = connectionTimeoutReconnectRegion(signalingServer: signalingServer)
         Logger.log.i(message: "Socket:: Triggering reconnect due to timeout with region: \(String(describing: reconnectRegion))")
-        delegate?.onSocketDisconnected(reconnect: true, region: reconnectRegion)
+        delegate?.onSocketDisconnected(socket: self, reconnect: true, region: reconnectRegion)
     }
 
     /// Region override to pass to TxClient after a connection timeout.

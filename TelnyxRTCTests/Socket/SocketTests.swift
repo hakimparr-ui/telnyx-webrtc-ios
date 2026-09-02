@@ -11,7 +11,7 @@ import Starscream
 @testable import TelnyxRTC
 
 class SocketTests : XCTestCase, SocketDelegate {
-    func onSocketDisconnected(reconnect: Bool, region: TelnyxRTC.Region?) {
+    func onSocketDisconnected(socket: Socket, reconnect: Bool, region: TelnyxRTC.Region?) {
         //Handle socket disconnected
         socketDisconnectedExpectation?.fulfill()
     }
@@ -23,15 +23,15 @@ class SocketTests : XCTestCase, SocketDelegate {
     
     var isPing = false
 
-    func onSocketConnected() {
+    func onSocketConnected(socket: Socket) {
         socketConnectedExpectation?.fulfill()
     }
 
-    func onSocketError(error: Error) {
+    func onSocketError(socket: Socket, error: Error) {
         //TODO: find a way to force different socket errors.
     }
 
-    func onMessageReceived(message: String) {
+    func onMessageReceived(socket: Socket, message: String) {
         //For now we are not checking the response, just if we get any response.
         let serverResponse = Message().decode(message: message)
         errorResponse = serverResponse?.serverError

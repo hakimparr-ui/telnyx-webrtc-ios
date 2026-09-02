@@ -103,7 +103,7 @@ extension CallTests : CallProtocol {
 
 // MARK: - SocketDelegate
 extension CallTests : SocketDelegate {
-    func onSocketDisconnected(reconnect: Bool, region: TelnyxRTC.Region?) {
+    func onSocketDisconnected(socket: Socket, reconnect: Bool, region: TelnyxRTC.Region?) {
         //
     }
     
@@ -111,7 +111,7 @@ extension CallTests : SocketDelegate {
        //
     }
     
-    func onSocketConnected() {
+    func onSocketConnected(socket: Socket) {
         print("Socket connected")
         expectation?.fulfill()
     }
@@ -120,11 +120,11 @@ extension CallTests : SocketDelegate {
         //
     }
 
-    func onSocketError(error: Error) {
+    func onSocketError(socket: Socket, error: Error) {
         //
     }
 
-    func onMessageReceived(message: String) {
+    func onMessageReceived(socket: Socket, message: String) {
         print("CallTests :: SocketDelegate onMessageReceived")
         expectation?.fulfill()
     }

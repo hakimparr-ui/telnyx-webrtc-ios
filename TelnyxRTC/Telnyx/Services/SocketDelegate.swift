@@ -9,8 +9,8 @@
 import Foundation
 
 protocol SocketDelegate: AnyObject {
-    func onSocketConnected()
-    func onSocketDisconnected(reconnect:Bool,region:Region?)
-    func onSocketError(error: Error)
-    func onMessageReceived(message: String)
+    func onSocketConnected(socket: Socket)
+    func onSocketDisconnected(socket: Socket, reconnect: Bool, region: Region?)
+    func onSocketError(socket: Socket, error: Error)
+    func onMessageReceived(socket: Socket, message: String)
 }
