@@ -1517,8 +1517,9 @@ public class TxClient {
     /// The delegate is notified only after the exact request is acknowledged on
     /// the socket that sent it. A newer request supersedes any pending request.
     public func disablePushNotifications() {
-        let start = { [weak self] in
-            self?.startDisablePushNotifications()
+        let start: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            self.startDisablePushNotifications()
         }
         if Thread.isMainThread {
             start()
