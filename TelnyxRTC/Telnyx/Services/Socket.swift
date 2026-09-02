@@ -82,17 +82,20 @@ class Socket {
         self.socket?.disconnect()
     }
     
-    func sendMessage(message: String?) {
+    @discardableResult
+    func sendMessage(message: String?) -> Bool {
         if self.isConnected == false {
             Logger.log.e(message: "Socket:: not connected...")
-            return
+            return false
         }
         if let message = message,
            let socket = self.socket {
             socket.write(string: message)
             Logger.log.verto(message: "Socket:: sendMessage() message: \(message)", direction: .outbound)
+            return true
         } else {
             Logger.log.e(message: "Socket:: sendMessage() Error sending message...")
+            return false
         }
     }
     

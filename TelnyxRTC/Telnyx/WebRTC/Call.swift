@@ -794,12 +794,33 @@ extension Call {
     public func hangup() {
         Logger.log.i(message: "Call:: hangup()")
         guard let sessionId = self.sessionId else { return }
-        
-        // Create a termination reason for local hangup
-        // Use USER_BUSY for incoming calls (NEW state) and outbound calls not yet connected (RINGING, CONNECTING)
-        // Use NORMAL_CLEARING for active calls
-        let causeCode: CauseCode
+        let (causeCode, terminationReason) = localTerminationDetails()
 
+        let byeMessage = ByeMessage(sessionId: sessionId, callId: signalingCallId.uuidString, causeCode: causeCode)
+        let message = byeMessage.encode() ?? ""
+        self.socket?.sendMessage(message: message)
+        self.endCall(terminationReason: terminationReason)
+    }
+
+    @discardableResult
+    internal func hangup(using signalingSocket: Socket) -> Bool {
+        guard let sessionId = self.sessionId else { return false }
+        let (causeCode, terminationReason) = localTerminationDetails()
+        let byeMessage = ByeMessage(
+            sessionId: sessionId,
+            callId: signalingCallId.uuidString,
+            causeCode: causeCode
+        )
+        guard signalingSocket.sendMessage(message: byeMessage.encode()) else {
+            return false
+        }
+        self.socket = signalingSocket
+        self.endCall(terminationReason: terminationReason)
+        return true
+    }
+
+    private func localTerminationDetails() -> (CauseCode, CallTerminationReason) {
+        let causeCode: CauseCode
         switch callState {
         case .ACTIVE, .HELD:
             causeCode = .NORMAL_CLEARING
@@ -808,16 +829,13 @@ extension Call {
         default:
             causeCode = .NORMAL_CLEARING
         }
-
-        let terminationReason = CallTerminationReason(
-            cause: ByeMessage.getCauseFromCode(causeCode: causeCode),
-            causeCode: causeCode.rawValue
+        return (
+            causeCode,
+            CallTerminationReason(
+                cause: ByeMessage.getCauseFromCode(causeCode: causeCode),
+                causeCode: causeCode.rawValue
+            )
         )
-
-        let byeMessage = ByeMessage(sessionId: sessionId, callId: signalingCallId.uuidString, causeCode: causeCode)
-        let message = byeMessage.encode() ?? ""
-        self.socket?.sendMessage(message: message)
-        self.endCall(terminationReason: terminationReason)
     }
 
     /// Starts the process to answer the incoming call.
@@ -1350,7 +1368,7 @@ extension Call {
                 }
             }
             
-            // Close call with termination reason
+            txClient.acceptRemoteTerminationEvidence(callId: callInfo?.callId)
             self.endCall(terminationReason: terminationReason)
             
             if(txClient.sendFileLogs){
@@ -1782,4 +1800,3 @@ extension Call {
         lastAudioResetTime = Date()
     }
 }
-

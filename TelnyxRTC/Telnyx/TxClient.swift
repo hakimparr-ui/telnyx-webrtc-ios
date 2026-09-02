@@ -125,6 +125,13 @@ public extension Notification.Name {
 /// }
 /// ```
 public class TxClient {
+    private struct PendingActiveCallTermination {
+        let callId: UUID
+        let generation: UInt
+        var completions: [(Bool) -> Void]
+        var timeoutWorkItem: DispatchWorkItem?
+    }
+
     /// Tracks the internal VoIP push handoff before a real incoming `Call` may exist.
     ///
     /// This state is intentionally separate from `CallState`: it coordinates socket/login/INVITE
@@ -188,6 +195,21 @@ public class TxClient {
     private var pendingDeclineGatewayMessageId: String?
     private var isReconnectPendingForCallKitDecline: Bool = false
     private var pendingDeclineReconnectGeneration: UInt = 0
+    private var pendingActiveCallTerminations: [UUID: PendingActiveCallTermination] = [:]
+    private var activeCallTerminationGeneration: UInt = 0
+    private var activeCallTerminationReconnectGeneration: UInt = 0
+    private var activeCallTerminationReconnectAttempts: Int = 0
+    private var isActiveCallTerminationReconnectScheduled: Bool = false
+    private var activeCallTerminationAuthenticationGeneration: UInt = 0
+    private var activeCallTerminationLoginMessageId: String?
+    private var activeCallTerminationLoginAccepted: Bool = false
+    private var activeCallTerminationClientReadySeen: Bool = false
+    private var activeCallTerminationGatewayMessageId: String?
+    private var activeCallTerminationAuthenticationSocket: Socket?
+    private var activeCallTerminationAuthenticatedSocket: Socket?
+    internal var activeCallTerminationRetryInterval: TimeInterval = 4.0
+    internal var activeCallTerminationMaxReconnectAttempts: Int = 3
+    internal var socketFactory: () -> Socket = { Socket() }
     
     // Timeout mechanism for VoIP push calls
     private var inviteTimeoutTimer: Timer?
@@ -331,6 +353,8 @@ public class TxClient {
     
     /// Deinitializer to ensure proper cleanup of resources
     deinit {
+        completeAllActiveCallTerminations(success: false)
+
         // Cancel reconnect timeout timer if it exists
         reconnectTimeoutTimer?.cancel()
         reconnectTimeoutTimer = nil
@@ -543,7 +567,7 @@ public class TxClient {
         } else {
             self.serverConfiguration = serverConfiguration
         }
-        self.socket = Socket()
+        self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -566,7 +590,7 @@ public class TxClient {
                                                          pushMetaData: self.pushMetaData)
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
-        self.socket = Socket()
+        self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -583,7 +607,7 @@ public class TxClient {
         self.serverConfiguration = serverConfiguration
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
-        self.socket = Socket()
+        self.socket = socketFactory()
         self.socket?.delegate = self
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
     }
@@ -663,6 +687,7 @@ public class TxClient {
     /// Disconnects the TxClient from the Telnyx signaling server.
     public func disconnect() {
         Logger.log.i(message: "TxClient:: disconnect()")
+        completeAllActiveCallTerminations(success: false)
         cleanupPendingCallKitDecline(
             reason: "client disconnected before decline_push was accepted"
         )
@@ -703,6 +728,323 @@ public class TxClient {
     public func isConnected() -> Bool {
         guard let isConnected = socket?.isConnected else { return false }
         return isConnected
+    }
+
+    /// Ends an active call after its `BYE` has been queued on the currently authenticated signalling socket.
+    /// If signalling is unavailable, the client performs up to three bounded reconnect and authentication attempts.
+    /// An exact remote `BYE` received while the request is pending also completes the request successfully.
+    /// - Parameters:
+    ///   - callId: The app-facing UUID of the call to end.
+    ///   - timeout: The maximum time to retain and recover the termination request.
+    ///   - completion: Called exactly once with `true` after the `BYE` is queued or exact remote termination is observed.
+    public func endCallWhenSignalingReady(
+        callId: UUID,
+        timeout: TimeInterval = 12.0,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let start = { [weak self] in
+            guard let self else {
+                completion(false)
+                return
+            }
+            self.startActiveCallTermination(
+                callId: callId,
+                timeout: timeout,
+                completion: completion
+            )
+        }
+        if Thread.isMainThread {
+            start()
+        } else {
+            DispatchQueue.main.async(execute: start)
+        }
+    }
+
+    internal func acceptRemoteTerminationEvidence(callId: UUID?) {
+        guard let callId else { return }
+        performOnActiveCallTerminationQueue { [weak self] in
+            self?.completeActiveCallTermination(callId: callId, success: true)
+        }
+    }
+
+    private func startActiveCallTermination(
+        callId: UUID,
+        timeout: TimeInterval,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let call = call(forSocketCallId: callId),
+              let exactCallId = call.callInfo?.callId else {
+            completion(false)
+            return
+        }
+        if case .DONE = call.callState {
+            completion(false)
+            return
+        }
+
+        if var pending = pendingActiveCallTerminations[exactCallId] {
+            pending.completions.append(completion)
+            pendingActiveCallTerminations[exactCallId] = pending
+            return
+        }
+
+        if gatewayState == .REGED,
+           let currentSocket = socket,
+           currentSocket.isConnected {
+            activeCallTerminationAuthenticatedSocket = currentSocket
+        }
+
+        activeCallTerminationGeneration &+= 1
+        let generation = activeCallTerminationGeneration
+        var pending = PendingActiveCallTermination(
+            callId: exactCallId,
+            generation: generation,
+            completions: [completion],
+            timeoutWorkItem: nil
+        )
+        let timeoutWorkItem = DispatchWorkItem { [weak self] in
+            self?.timeoutActiveCallTermination(
+                callId: exactCallId,
+                generation: generation
+            )
+        }
+        pending.timeoutWorkItem = timeoutWorkItem
+        pendingActiveCallTerminations[exactCallId] = pending
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.0, timeout),
+            execute: timeoutWorkItem
+        )
+        drainActiveCallTerminationsIfReady()
+    }
+
+    private func timeoutActiveCallTermination(callId: UUID, generation: UInt) {
+        guard pendingActiveCallTerminations[callId]?.generation == generation else {
+            return
+        }
+        completeActiveCallTermination(callId: callId, success: false)
+    }
+
+    private func drainActiveCallTerminationsIfReady() {
+        guard !pendingActiveCallTerminations.isEmpty else { return }
+        guard gatewayState == .REGED,
+              let currentSocket = socket,
+              currentSocket.isConnected,
+              activeCallTerminationAuthenticatedSocket === currentSocket else {
+            scheduleActiveCallTerminationRecovery()
+            return
+        }
+
+        invalidateActiveCallTerminationRecovery(resetAttempts: true)
+        for callId in Array(pendingActiveCallTerminations.keys) {
+            guard pendingActiveCallTerminations[callId] != nil,
+                  let call = call(forSocketCallId: callId) else {
+                continue
+            }
+            if call.hangup(using: currentSocket) {
+                completeActiveCallTermination(callId: callId, success: true)
+            }
+        }
+    }
+
+    private func scheduleActiveCallTerminationRecovery(delay: TimeInterval? = nil) {
+        performOnActiveCallTerminationQueue { [weak self] in
+            guard let self,
+                  !self.pendingActiveCallTerminations.isEmpty,
+                  !self.isActiveCallTerminationReconnectScheduled,
+                  self.activeCallTerminationReconnectAttempts < self.activeCallTerminationMaxReconnectAttempts else {
+                return
+            }
+            if self.isActiveCallTerminationSignalingReady {
+                self.drainActiveCallTerminationsIfReady()
+                return
+            }
+
+            self.isActiveCallTerminationReconnectScheduled = true
+            self.activeCallTerminationReconnectGeneration &+= 1
+            let generation = self.activeCallTerminationReconnectGeneration
+            let recoveryDelay = delay ?? (self.socket?.isConnected == true
+                ? self.activeCallTerminationRetryInterval
+                : 0.0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + recoveryDelay) { [weak self] in
+                guard let self,
+                      self.isActiveCallTerminationReconnectScheduled,
+                      self.activeCallTerminationReconnectGeneration == generation,
+                      !self.pendingActiveCallTerminations.isEmpty else {
+                    return
+                }
+                self.isActiveCallTerminationReconnectScheduled = false
+                self.attemptActiveCallTerminationRecovery()
+            }
+        }
+    }
+
+    private func attemptActiveCallTerminationRecovery() {
+        guard !pendingActiveCallTerminations.isEmpty else { return }
+        if isActiveCallTerminationSignalingReady {
+            drainActiveCallTerminationsIfReady()
+            return
+        }
+        guard activeCallTerminationReconnectAttempts < activeCallTerminationMaxReconnectAttempts else {
+            return
+        }
+        guard let reconnectConfig = txConfig ?? storedTxConfig else {
+            completeAllActiveCallTerminations(success: false)
+            return
+        }
+
+        activeCallTerminationReconnectAttempts += 1
+        if let currentSocket = socket,
+           currentSocket.isConnected {
+            _ = beginActiveCallTerminationAuthentication(
+                on: currentSocket,
+                txConfig: reconnectConfig
+            )
+        } else {
+            resetActiveCallTerminationAuthentication()
+            do {
+                try connect(
+                    txConfig: reconnectConfig,
+                    serverConfiguration: storedServerConfiguration ?? serverConfiguration
+                )
+            } catch {
+                Logger.log.e(message: "TxClient:: active call termination reconnect failed: \(error.localizedDescription)")
+            }
+        }
+        scheduleActiveCallTerminationRecovery(delay: activeCallTerminationRetryInterval)
+    }
+
+    private var isActiveCallTerminationSignalingReady: Bool {
+        gatewayState == .REGED &&
+            socket?.isConnected == true &&
+            activeCallTerminationAuthenticatedSocket === socket
+    }
+
+    private func beginActiveCallTerminationAuthentication(
+        on socket: Socket,
+        txConfig: TxConfig
+    ) -> Bool {
+        guard let sessionId else { return false }
+        let pushToken = txConfig.pushNotificationConfig?.pushDeviceToken
+        let pushProvider = txConfig.pushNotificationConfig?.pushNotificationProvider
+        let loginMessage: LoginMessage
+        if let token = txConfig.token {
+            loginMessage = LoginMessage(
+                token: token,
+                pushDeviceToken: pushToken,
+                pushNotificationProvider: pushProvider,
+                startFromPush: false,
+                pushEnvironment: txConfig.pushEnvironment,
+                sessionId: sessionId,
+                declinePush: false,
+                enableMissedCallNotifications: txConfig.enableMissedCallNotifications,
+                pushWhenActive: txConfig.pushWhenActive
+            )
+        } else {
+            guard let sipUser = txConfig.sipUser,
+                  let password = txConfig.password else {
+                return false
+            }
+            loginMessage = LoginMessage(
+                user: sipUser,
+                password: password,
+                pushDeviceToken: pushToken,
+                pushNotificationProvider: pushProvider,
+                startFromPush: false,
+                pushEnvironment: txConfig.pushEnvironment,
+                sessionId: sessionId,
+                declinePush: false,
+                enableMissedCallNotifications: txConfig.enableMissedCallNotifications,
+                pushWhenActive: txConfig.pushWhenActive
+            )
+        }
+
+        activeCallTerminationAuthenticationGeneration &+= 1
+        activeCallTerminationLoginMessageId = loginMessage.id
+        activeCallTerminationLoginAccepted = false
+        activeCallTerminationClientReadySeen = false
+        activeCallTerminationGatewayMessageId = nil
+        activeCallTerminationAuthenticationSocket = socket
+        activeCallTerminationAuthenticatedSocket = nil
+        gatewayState = .NOREG
+        guard socket.sendMessage(message: loginMessage.encode()) else {
+            resetActiveCallTerminationAuthentication()
+            return false
+        }
+        return true
+    }
+
+    private func advanceActiveCallTerminationAuthenticationIfReady() {
+        guard !pendingActiveCallTerminations.isEmpty,
+              activeCallTerminationLoginAccepted,
+              activeCallTerminationClientReadySeen,
+              activeCallTerminationGatewayMessageId == nil,
+              let authenticationSocket = activeCallTerminationAuthenticationSocket,
+              authenticationSocket === socket else {
+            return
+        }
+        let gatewayMessage = GatewayMessage()
+        activeCallTerminationGatewayMessageId = gatewayMessage.id
+        guard authenticationSocket.sendMessage(message: gatewayMessage.encode()) else {
+            activeCallTerminationGatewayMessageId = nil
+        }
+    }
+
+    private func resetActiveCallTerminationAuthentication() {
+        activeCallTerminationAuthenticationGeneration &+= 1
+        activeCallTerminationLoginMessageId = nil
+        activeCallTerminationLoginAccepted = false
+        activeCallTerminationClientReadySeen = false
+        activeCallTerminationGatewayMessageId = nil
+        activeCallTerminationAuthenticationSocket = nil
+        activeCallTerminationAuthenticatedSocket = nil
+    }
+
+    private func completeActiveCallTermination(callId: UUID, success: Bool) {
+        let exactCallId: UUID
+        if pendingActiveCallTerminations[callId] != nil {
+            exactCallId = callId
+        } else if let appCallId = socketToAppCallId[callId],
+                  pendingActiveCallTerminations[appCallId] != nil {
+            exactCallId = appCallId
+        } else {
+            return
+        }
+        guard let pending = pendingActiveCallTerminations.removeValue(forKey: exactCallId) else {
+            return
+        }
+        pending.timeoutWorkItem?.cancel()
+        if pendingActiveCallTerminations.isEmpty {
+            invalidateActiveCallTerminationRecovery(resetAttempts: true)
+            resetActiveCallTerminationAuthentication()
+        }
+        pending.completions.forEach { $0(success) }
+    }
+
+    private func completeAllActiveCallTerminations(success: Bool) {
+        let pending = Array(pendingActiveCallTerminations.values)
+        pendingActiveCallTerminations.removeAll()
+        invalidateActiveCallTerminationRecovery(resetAttempts: true)
+        resetActiveCallTerminationAuthentication()
+        pending.forEach { request in
+            request.timeoutWorkItem?.cancel()
+            request.completions.forEach { $0(success) }
+        }
+    }
+
+    private func invalidateActiveCallTerminationRecovery(resetAttempts: Bool) {
+        activeCallTerminationReconnectGeneration &+= 1
+        isActiveCallTerminationReconnectScheduled = false
+        if resetAttempts {
+            activeCallTerminationReconnectAttempts = 0
+        }
+    }
+
+    private func performOnActiveCallTerminationQueue(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
     
     /// Answers an incoming call from CallKit and manages the active call flow.
@@ -1064,7 +1406,7 @@ public class TxClient {
             Logger.log.i(message: "TxClient:: anonymousLogin() serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
             
             // Initialize socket and start connection
-            self.socket = Socket()
+            self.socket = socketFactory()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
             self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -1130,9 +1472,21 @@ public class TxClient {
                 )
                 return
             }
+        } else if !pendingActiveCallTerminations.isEmpty {
+            guard activeCallTerminationLoginAccepted,
+                  responseId == activeCallTerminationGatewayMessageId,
+                  let authenticationSocket = activeCallTerminationAuthenticationSocket,
+                  authenticationSocket === socket else {
+                Logger.log.i(
+                    message: "TxClient:: ignoring gateway state outside the active termination transaction"
+                )
+                return
+            }
         }
 
-        if self.gatewayState == .REGED && !pendingCallDecline {
+        if self.gatewayState == .REGED &&
+            !pendingCallDecline &&
+            pendingActiveCallTerminations.isEmpty {
             // If the client is already registered, we don't need to do anything else.
             return
         }
@@ -1151,6 +1505,21 @@ public class TxClient {
                     confirmPendingCallKitDecline()
                     self.disconnect()
                     return
+                }
+
+                if !pendingActiveCallTerminations.isEmpty,
+                   let authenticationSocket = activeCallTerminationAuthenticationSocket,
+                   authenticationSocket === socket {
+                    activeCallTerminationAuthenticatedSocket = authenticationSocket
+                    activeCallTerminationLoginMessageId = nil
+                    activeCallTerminationLoginAccepted = false
+                    activeCallTerminationClientReadySeen = false
+                    activeCallTerminationGatewayMessageId = nil
+                    activeCallTerminationAuthenticationSocket = nil
+                }
+
+                performOnActiveCallTerminationQueue { [weak self] in
+                    self?.drainActiveCallTerminationsIfReady()
                 }
                 
                 self.delegate?.onClientReady()
@@ -1820,6 +2189,16 @@ extension TxClient : SocketDelegate {
             }
         }
 
+        if !pendingActiveCallTerminations.isEmpty,
+           let currentSocket = socket,
+           let currentConfig = txConfig ?? storedTxConfig {
+            _ = beginActiveCallTerminationAuthentication(
+                on: currentSocket,
+                txConfig: currentConfig
+            )
+            return
+        }
+
         // Check if there's a pending anonymous login message
         if let pendingMessage = self.pendingAnonymousLoginMessage {
             Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected() sending pending anonymous login message")
@@ -1879,6 +2258,13 @@ extension TxClient : SocketDelegate {
     }
     
     func onSocketDisconnected(reconnect: Bool, region: Region?) {
+        if !pendingActiveCallTerminations.isEmpty {
+            gatewayState = .NOREG
+            resetActiveCallTerminationAuthentication()
+            scheduleActiveCallTerminationRecovery()
+            delegate?.onSocketDisconnected()
+            return
+        }
         if reconnect {
             Logger.log.i(message: "TxClient:: SocketDelegate  Reconnecting")
             let declineReconnectGeneration: UInt?
@@ -1935,6 +2321,11 @@ extension TxClient : SocketDelegate {
 
     func onSocketError(error: Error) {
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketError()")
+        if !pendingActiveCallTerminations.isEmpty {
+            gatewayState = .NOREG
+            resetActiveCallTerminationAuthentication()
+            scheduleActiveCallTerminationRecovery()
+        }
         if pendingCallDecline && !isReconnectPendingForCallKitDecline {
             cleanupPendingCallKitDecline(reason: "socket error before decline_push login completed")
         }
@@ -1965,12 +2356,13 @@ extension TxClient : SocketDelegate {
         if let error = vertoMessage.serverError {
             if attachCallId == vertoMessage.id {
                 // Call failed from remote end
-              if let callId = pushMetaData?["call_id"] as? String,
+                if let callId = pushMetaData?["call_id"] as? String,
                 let callUUID = UUID(uuidString: callId) {
                   Logger.log.i(message: "TxClient:: Attach Call ID \(String(describing: callId))")
                   FileLogger.shared.log("Error Recieved, Remote Call Ended Line 764")
                   // Create a termination reason for the error
                   let terminationReason = CallTerminationReason(cause: "REMOTE_ERROR")
+                  acceptRemoteTerminationEvidence(callId: callUUID)
                   self.delegate?.onRemoteCallEnded(callId: callUUID, reason: terminationReason)
                   self.delegate?.onCallStateUpdated(callState: .DONE(reason: terminationReason), callId: callUUID)
                 }
@@ -1987,6 +2379,13 @@ extension TxClient : SocketDelegate {
                     reason: "decline_push server error \(code): \(message)"
                 )
             }
+            if !pendingActiveCallTerminations.isEmpty &&
+                (vertoMessage.id == activeCallTerminationLoginMessageId ||
+                    vertoMessage.id == activeCallTerminationGatewayMessageId) {
+                resetActiveCallTerminationAuthentication()
+                gatewayState = .NOREG
+                scheduleActiveCallTerminationRecovery(delay: 0.0)
+            }
 
             // Use the existing ServerErrorReason.signalingServerError approach
             let err = TxError.serverError(reason: .signalingServerError(message: message, code: code))
@@ -1999,6 +2398,11 @@ extension TxClient : SocketDelegate {
                 vertoMessage.id == pendingDeclineLoginMessageId {
                 pendingDeclineLoginAccepted = true
                 advancePendingDeclineIfReady()
+            }
+            if !pendingActiveCallTerminations.isEmpty &&
+                vertoMessage.id == activeCallTerminationLoginMessageId {
+                activeCallTerminationLoginAccepted = true
+                advanceActiveCallTerminationAuthenticationIfReady()
             }
             // Process gateway state result.
             if let params = result["params"] as? [String: Any],
@@ -2072,6 +2476,9 @@ extension TxClient : SocketDelegate {
                     if pendingCallDecline {
                         pendingDeclineClientReadySeen = true
                         advancePendingDeclineIfReady()
+                    } else if !pendingActiveCallTerminations.isEmpty {
+                        activeCallTerminationClientReadySeen = true
+                        advanceActiveCallTerminationAuthenticationIfReady()
                     } else {
                         self.requestGatewayState()
                     }
