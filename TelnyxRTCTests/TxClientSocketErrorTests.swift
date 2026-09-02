@@ -354,6 +354,28 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
     }
 
+    func testAttachErrorWithoutPendingTerminationRetainsProviderCall() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        installActiveCall(
+            appCallId: callId,
+            signalingCallId: callId,
+            socket: socket
+        )
+        txClient.sendAttachCall()
+        let attachMessageId = try latestAttachMessageId(in: socket)
+
+        socket.emitMessage(attachError(id: attachMessageId))
+
+        XCTAssertTrue(mockDelegate.onClientErrorCalled)
+        XCTAssertTrue(mockDelegate.remoteEndedCallIds.isEmpty)
+        XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertNotNil(txClient.getCall(callId: callId))
+        XCTAssertNil(privateString(named: "attachCallId"))
+    }
+
     func testActiveTerminationReconnectAttemptsAreBounded() throws {
         let sockets = (0..<4).map { _ in
             ActiveTerminationTestSocket(connectsSuccessfully: false)

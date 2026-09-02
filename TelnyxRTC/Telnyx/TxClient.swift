@@ -2815,7 +2815,6 @@ extension TxClient : SocketDelegate {
             )
             if attachCallId == vertoMessage.id {
                 attachCallId = nil
-                // Call failed from remote end
                 if let callId = pushMetaData?["call_id"] as? String,
                 let callUUID = UUID(uuidString: callId) {
                   if pendingActiveCallTerminationCallId(
@@ -2827,15 +2826,14 @@ extension TxClient : SocketDelegate {
                     scheduleActiveCallTerminationRecovery(delay: 0.0)
                     return
                   }
-                  Logger.log.i(message: "TxClient:: Attach Call ID \(String(describing: callId))")
-                  FileLogger.shared.log("Error Recieved, Remote Call Ended Line 764")
-                  // Create a termination reason for the error
-                  let terminationReason = CallTerminationReason(cause: "REMOTE_ERROR")
-                  acceptRemoteTerminationEvidence(callId: callUUID)
-                  self.delegate?.onRemoteCallEnded(callId: callUUID, reason: terminationReason)
-                  self.delegate?.onCallStateUpdated(callState: .DONE(reason: terminationReason), callId: callUUID)
+                  Logger.log.i(
+                    message: "TxClient:: ATTACH error is not remote termination evidence for \(callUUID)"
+                  )
                 }
-                return
+                // Authentication, gateway, or transient reattach failures can
+                // all reject ATTACH while the carrier call still exists. Let
+                // the normal client error and bounded invite recovery paths
+                // handle it without manufacturing remote BYE or DONE.
             }
             let message: String = error["message"] as? String ?? "Unknown"
             let codeInt: Int = error["code"] as? Int ?? 0
