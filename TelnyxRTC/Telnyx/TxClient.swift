@@ -842,6 +842,22 @@ public class TxClient {
         }
         pending.timeoutWorkItem = timeoutWorkItem
         pendingActiveCallTerminations[exactCallId] = pending
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.0, timeout),
+            execute: timeoutWorkItem
+        )
+
+        // A live Call bound to the current registered socket is already exact
+        // authentication evidence. Queue BYE on that owning socket immediately
+        // instead of replacing its REGED state with a gateway re-verification.
+        // The response is still correlated by both message id and socket before
+        // local teardown, while disconnected or replaced sockets continue down
+        // the bounded recovery path below.
+        if queueActiveCallTerminationOnOwningSocketIfReady(
+            callId: exactCallId
+        ) {
+            return
+        }
         if !isActiveCallTerminationSignalingReady {
             if isRegistered,
                let currentSocket = socket,
@@ -856,11 +872,31 @@ public class TxClient {
                 )
             }
         }
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + max(0.0, timeout),
-            execute: timeoutWorkItem
-        )
         drainActiveCallTerminationsIfReady()
+    }
+
+    private func queueActiveCallTerminationOnOwningSocketIfReady(
+        callId: UUID
+    ) -> Bool {
+        guard gatewayState == .REGED,
+              let currentSocket = socket,
+              currentSocket.isConnected,
+              gatewayRegisteredSocket === currentSocket,
+              let currentSessionId = sessionId,
+              let call = call(forSocketCallId: callId),
+              call.socket === currentSocket,
+              var pending = pendingActiveCallTerminations[callId],
+              pending.byeMessageId == nil,
+              let byeMessageId = call.queueHangup(
+                using: currentSocket,
+                sessionId: currentSessionId
+              ) else {
+            return false
+        }
+        pending.byeMessageId = byeMessageId
+        pending.byeSocket = currentSocket
+        pendingActiveCallTerminations[callId] = pending
+        return true
     }
 
     private func timeoutActiveCallTermination(callId: UUID, generation: UInt) {
