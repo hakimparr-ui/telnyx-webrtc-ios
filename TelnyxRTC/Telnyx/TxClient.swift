@@ -165,6 +165,10 @@ public class TxClient {
     /// Subscribe to TxClient delegate to receive Telnyx SDK events
     public weak var delegate: TxClientDelegate?
     private var socket : Socket?
+    /// True while the socket created for a VoIP push is still opening. CallKit
+    /// can deliver an answer before WebSocket reports connected; in that case
+    /// answer on this socket instead of replacing it with a second one.
+    private var pushSocketConnectionPending = false
 
     private var answerCallAction: CXAnswerCallAction? = nil
     private var endCallAction: CXEndCallAction? = nil
@@ -633,6 +637,7 @@ public class TxClient {
         failPendingDisablePushForSocketReplacement()
         self.socket = socketFactory()
         self.socket?.delegate = self
+        self.pushSocketConnectionPending = true
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
     }
     
@@ -1315,6 +1320,10 @@ public class TxClient {
                 }
             } else {
                 Logger.log.i(message: "TxClient:: answerFromCallkit - Socket not connected, connecting first")
+                if pushSocketConnectionPending, socket != nil {
+                    Logger.log.i(message: "TxClient:: answerFromCallkit - Push socket is already connecting, waiting for it")
+                    return
+                }
                 do {
                     try connectSocketOnly(serverConfiguration: storedServerConfiguration!)
                     // Login will happen in onSocketConnected
@@ -2584,6 +2593,7 @@ extension TxClient : SocketDelegate {
             return
         }
         clearObsoleteActiveCallTerminationByeTransactions(currentSocket: sourceSocket)
+        pushSocketConnectionPending = false
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected()")
         isReconnectPendingForCallKitDecline = false
         self.delegate?.onSocketConnected()
@@ -2689,6 +2699,7 @@ extension TxClient : SocketDelegate {
             Logger.log.i(message: "TxClient:: ignoring disconnected callback from obsolete socket")
             return
         }
+        pushSocketConnectionPending = false
         if !pendingActiveCallTerminations.isEmpty {
             clearActiveCallTerminationByeTransactions(sentOn: sourceSocket)
             gatewayState = .NOREG
@@ -2762,6 +2773,7 @@ extension TxClient : SocketDelegate {
             Logger.log.i(message: "TxClient:: ignoring error callback from obsolete socket")
             return
         }
+        pushSocketConnectionPending = false
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketError()")
         if !pendingActiveCallTerminations.isEmpty {
             clearActiveCallTerminationByeTransactions(sentOn: sourceSocket)

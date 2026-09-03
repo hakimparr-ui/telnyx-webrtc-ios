@@ -153,6 +153,33 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(answerAction.failCallCount, 1)
     }
 
+    func testAnswerReusesPushSocketWhileItIsConnecting() throws {
+        let pushSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let replacementSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var sockets = [pushSocket, replacementSocket]
+        var socketCreationCount = 0
+        txClient.socketFactory = {
+            socketCreationCount += 1
+            return sockets.removeFirst()
+        }
+        let callUUID = UUID()
+        try startPushFlow(callId: callUUID)
+
+        let answerAction = TrackingAnswerCallAction(call: callUUID)
+        txClient.answerFromCallkit(answerAction: answerAction)
+
+        XCTAssertEqual(socketCreationCount, 1)
+        XCTAssertTrue(pushSocket.sentMessages.isEmpty)
+
+        pushSocket.emitConnected()
+
+        XCTAssertEqual(socketCreationCount, 1)
+        XCTAssertEqual(pushSocket.sentMessages.count, 1)
+        XCTAssertTrue(replacementSocket.sentMessages.isEmpty)
+        XCTAssertEqual(answerAction.fulfillCallCount, 0)
+        XCTAssertEqual(answerAction.failCallCount, 0)
+    }
+
     func testAnsweredPushInviteTimeoutUsesPushUUIDAndCompletesAnswerAction() throws {
         let callUUID = UUID()
         txClient.inviteTimeoutInterval = 0.01
