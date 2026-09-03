@@ -653,7 +653,7 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(socket.sentMessages.filter(isByeMessage).count, 1)
     }
 
-    func testActiveTerminationReverifiesCurrentRegisteredSocketBeforeBye() throws {
+    func testActiveTerminationUsesCurrentRegisteredOwningSocketImmediately() throws {
         let socket = ActiveTerminationTestSocket(connectsSuccessfully: true)
         txClient.socketFactory = { socket }
         try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
@@ -662,20 +662,14 @@ class TxClientPingAuthTests: XCTestCase {
         socket.emitMessage(gatewayStateMessage(state: "REGED", id: "normal-registration"))
         XCTAssertTrue(txClient.isRegistered)
 
-        let completed = expectation(description: "registered socket reverified")
+        let completed = expectation(description: "registered owning socket completed")
         var results: [Bool] = []
         txClient.endCallWhenSignalingReady(callId: callId) { success in
             results.append(success)
             completed.fulfill()
         }
         XCTAssertTrue(results.isEmpty)
-        XCTAssertFalse(socket.sentMessages.contains(where: isByeMessage))
-
-        let verificationId = try XCTUnwrap(privateString(named: "activeCallTerminationGatewayMessageId"))
-        XCTAssertNotEqual(verificationId, "normal-registration")
-        socket.emitMessage(gatewayStateMessage(state: "REGED", id: verificationId))
-        XCTAssertTrue(results.isEmpty)
-        XCTAssertNotNil(txClient.getCall(callId: callId))
+        XCTAssertNil(privateString(named: "activeCallTerminationGatewayMessageId"))
         let byeMessageId = try latestByeMessageId(in: socket)
         socket.emitMessage(byeAcknowledgement(id: byeMessageId))
         wait(for: [completed], timeout: 1.0)
