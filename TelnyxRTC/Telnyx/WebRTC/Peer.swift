@@ -265,7 +265,14 @@ class Peer : NSObject, WebRTCEventHandler {
             do {
                 Logger.log.i(message: "Peer:: Configuring AVAudioSession")
                 self.rtcAudioSession.useManualAudio = true
-                self.rtcAudioSession.isAudioEnabled = false
+                // CallKit owns the audio-device lifetime when manual audio is
+                // enabled. Peer creation can finish after
+                // provider(_:didActivate:), so forcing the shared device off
+                // here races a valid answered call and leaves its local track
+                // sending digital silence. The device is disabled by default
+                // and the CallKit deactivation callback still disables it at
+                // the end of the call. Preserve the current owner state while
+                // this peer applies only its category and buffer settings.
                 try rtcAudioSession.setCategory(AVAudioSession.Category.playAndRecord,
                                                 mode: AVAudioSession.Mode.voiceChat,
                                                 options: [
@@ -1233,4 +1240,3 @@ extension Peer : RTCPeerConnectionDelegate {
         Logger.log.i(message: "Peer:: connection didOpen RTCDataChannel: \(dataChannel)")
     }
 }
-
