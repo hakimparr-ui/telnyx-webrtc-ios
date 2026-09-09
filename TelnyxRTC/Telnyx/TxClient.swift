@@ -197,6 +197,10 @@ public class TxClient {
     private var enableQualityMetrics: Bool = false
     private var isACMResetInProgress: Bool = false
     private var pendingAnonymousLoginMessage: AnonymousLoginMessage?
+    // External notifications can synchronously reenter a client delegate. Keep
+    // this ownership lock separate from WebRTC's nonrecursive configuration lock.
+    private let callKitAudioLock = NSRecursiveLock()
+    private var callKitAudioSession: AVAudioSession?
     
     /// AI Assistant Manager for handling AI-related functionality
     public let aiAssistantManager = AIAssistantManager()
@@ -277,17 +281,30 @@ public class TxClient {
             return RTCAudioSession.sharedInstance().isAudioEnabled
         }
         set {
-            if newValue {
-                RTCAudioSession.sharedInstance().audioSessionDidActivate(AVAudioSession.sharedInstance())
-            } else {
-                RTCAudioSession.sharedInstance().audioSessionDidDeactivate(AVAudioSession.sharedInstance())
-            }
-            RTCAudioSession.sharedInstance().isAudioEnabled = newValue
+            updateCallKitAudioSession(
+                AVAudioSession.sharedInstance(),
+                active: newValue
+            )
         }
     }
+
+    /// Prepares recording and playback before a CallKit answer or start action
+    /// can be fulfilled. This does not activate the session or enable audio.
+    /// CallKit remains responsible for activation through `provider(_:didActivate:)`.
+    /// Configuration errors are returned to the caller before it accepts the call.
+    public func prepareAudioSessionForCallKit() throws {
+        let rtcAudioSession = RTCAudioSession.sharedInstance()
+        rtcAudioSession.lockForConfiguration()
+        defer { rtcAudioSession.unlockForConfiguration() }
+
+        let configuration = RTCAudioSessionConfiguration.webRTC()
+        configuration.categoryOptions = [.duckOthers, .allowBluetooth]
+        try rtcAudioSession.setConfiguration(configuration)
+    }
     
-    /// Enables and configures the audio session for a call.
-    /// This method sets up the appropriate audio configuration and activates the session.
+    /// Reports CallKit's external activation and enables the audio device.
+    /// Prepare the session with `prepareAudioSessionForCallKit()` before fulfilling
+    /// the answer or start action. Configuration here also supports existing callers.
     ///
     /// - Parameter audioSession: The AVAudioSession instance to configure
     /// - Important: This method MUST be called from the CXProviderDelegate's `provider(_:didActivate:)` callback
@@ -302,11 +319,11 @@ public class TxClient {
     /// ```
     public func enableAudioSession(audioSession: AVAudioSession) {
         setupCorrectAudioConfiguration()
-        setAudioSessionActive(true)
+        updateCallKitAudioSession(audioSession, active: true)
     }
     
-    /// Disables and resets the audio session.
-    /// This method cleans up the audio configuration and deactivates the session.
+    /// Reports CallKit's external deactivation and disables the audio device.
+    /// Repeated calls do not release another owner's activation contribution.
     ///
     /// - Parameter audioSession: The AVAudioSession instance to reset
     /// - Important: This method MUST be called from the CXProviderDelegate's `provider(_:didDeactivate:)` callback
@@ -320,8 +337,34 @@ public class TxClient {
     /// }
     /// ```
     public func disableAudioSession(audioSession: AVAudioSession) {
-        resetAudioConfiguration()
-        setAudioSessionActive(false)
+        updateCallKitAudioSession(audioSession, active: false)
+    }
+
+    private func updateCallKitAudioSession(_ audioSession: AVAudioSession, active: Bool) {
+        callKitAudioLock.lock()
+        defer { callKitAudioLock.unlock() }
+        let rtcAudioSession = RTCAudioSession.sharedInstance()
+
+        if active {
+            // CallKit can reactivate after an interruption without first sending
+            // didDeactivate. WebRTC must receive the new interruption end even
+            // when its enabled flag is already true. Replace only our previous
+            // external activation count, without stopping the device or asking
+            // AVAudioSession to activate or deactivate itself.
+            if let previousSession = callKitAudioSession {
+                rtcAudioSession.audioSessionDidDeactivate(previousSession)
+            }
+            callKitAudioSession = audioSession
+            rtcAudioSession.audioSessionDidActivate(audioSession)
+            // A synchronous delegate can revoke ownership during notification.
+            guard callKitAudioSession === audioSession else { return }
+            rtcAudioSession.isAudioEnabled = true
+        } else {
+            guard let ownedSession = callKitAudioSession else { return }
+            callKitAudioSession = nil
+            rtcAudioSession.audioSessionDidDeactivate(ownedSession)
+            rtcAudioSession.isAudioEnabled = false
+        }
     }
     
     /// The current audio route configuration.
@@ -3210,34 +3253,10 @@ extension TxClient {
     }
 
     internal func setupCorrectAudioConfiguration() {
-        let rtcAudioSession = RTCAudioSession.sharedInstance()
-        rtcAudioSession.lockForConfiguration()
-        
-        let configuration = RTCAudioSessionConfiguration.webRTC()
-        configuration.categoryOptions = [
-            .duckOthers,
-            .allowBluetooth,
-        ]
-        
         do {
-            try rtcAudioSession.setConfiguration(configuration)
+            try prepareAudioSessionForCallKit()
         } catch {
             Logger.log.e(message: "Failed to set RTC audio session configuration: \(error)")
         }
-        
-        rtcAudioSession.unlockForConfiguration()
-    }
-
-    internal func setAudioSessionActive(_ active: Bool) {
-        let rtcAudioSession = RTCAudioSession.sharedInstance()
-        
-        rtcAudioSession.lockForConfiguration()
-        do {
-            try rtcAudioSession.setActive(active)
-            rtcAudioSession.isAudioEnabled = active
-        } catch {
-            Logger.log.e(message: "Failed to set audio session active: \(error)")
-        }
-        rtcAudioSession.unlockForConfiguration()
     }
 }
