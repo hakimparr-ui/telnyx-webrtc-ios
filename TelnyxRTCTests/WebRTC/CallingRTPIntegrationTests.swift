@@ -105,7 +105,7 @@ final class CallingRTPIntegrationTests: XCTestCase {
 
     func testIncomingNegotiatesSecondPreferredPCMUCodec() throws {
         try connectIncoming(offeredCodecs: ["PCMU"], preferredCodecs: appPreferences, expectedCodec: "PCMU")
-        try assertAudioWindow(label: "second preferred incoming codec", duration: 2, expectedCodec: "PCMU")
+        try exerciseLifetime(expectedCodec: "PCMU")
         call?.hangup()
         try assertTerminal(origin: .localRequest)
     }
