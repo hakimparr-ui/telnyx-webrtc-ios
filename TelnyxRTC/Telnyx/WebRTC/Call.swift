@@ -1191,6 +1191,9 @@ extension Call {
     
     /// Resets the audio device and clears accumulated buffers to resolve persistent audio delay issues.
     ///
+    /// With manual audio enabled this leaves the device, track and route unchanged.
+    /// The application must manage recovery through its audio session owner.
+    ///
     /// This method addresses iOS audio delay problems where:
     /// - AudioDeviceModule buffers stretch under poor network conditions
     /// - WebRTC audio pacing causes frame accumulation
@@ -1514,10 +1517,13 @@ extension Call {
 
         // Restore speaker state after audio session is fully configured
         // Use verification and retry logic to ensure speaker is actually restored
-        if txClient.isSpeakerEnabled {
+        if !RTCAudioSession.sharedInstance().useManualAudio,
+           txClient.isSpeakerEnabled {
             Logger.log.w(message: "Speaker Enabled - will restore after audio session configuration")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak txClient] in
-                guard let txClient = txClient else { return }
+                guard let txClient = txClient,
+                      !RTCAudioSession.sharedInstance().useManualAudio,
+                      txClient.isSpeakerEnabled else { return }
                 Logger.log.i(message: "[ACM_RESET] Restoring speaker after attach/reconnect with verification")
                 txClient.restoreSpeakerAfterReconnect()
             }

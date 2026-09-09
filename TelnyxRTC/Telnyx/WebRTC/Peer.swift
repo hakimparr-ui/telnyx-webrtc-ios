@@ -674,6 +674,11 @@ extension Peer {
     /// - Parameter preserveSpeakerState: Whether to preserve the current speakerphone state during reset
     /// - Parameter forceSpeakerState: Optional forced speaker state to use instead of detecting current state
     func resetAudioDeviceModule(preserveSpeakerState: Bool = true, forceSpeakerState: Bool? = nil) {
+        // In manual mode the application owns activation, routes and mute.
+        // Recovery must not capture a temporary mute from another reset or
+        // reactivate audio after CallKit has withdrawn the session.
+        guard !rtcAudioSession.useManualAudio else { return }
+
         guard let connection = self.connection else {
             Logger.log.w(message: "[ACM_RESET] Peer:: resetAudioDeviceModule() - No active connection")
             return

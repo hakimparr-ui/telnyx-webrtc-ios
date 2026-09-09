@@ -531,6 +531,10 @@ public class TxClient {
     /// - Parameter maxAttempts: Maximum number of attempts to restore speaker (default: 5)
     /// - Parameter attempt: Current attempt number (used internally for recursion)
     private func restoreSpeakerWithVerification(maxAttempts: Int = 5, attempt: Int = 1) {
+        // Manual audio routes belong to the application. Check again for each
+        // retry because ownership may change while its callback is queued.
+        guard !RTCAudioSession.sharedInstance().useManualAudio else { return }
+
         Logger.log.i(message: "[ACM_RESET] TxClient:: Speaker restoration attempt \(attempt)/\(maxAttempts)")
 
         // Call setSpeaker to activate speaker
@@ -538,7 +542,8 @@ public class TxClient {
 
         // Wait a bit for iOS to process the change
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
+            guard let self = self,
+                  !RTCAudioSession.sharedInstance().useManualAudio else { return }
 
             // Verify if speaker is actually active
             let currentRoute = AVAudioSession.sharedInstance().currentRoute
