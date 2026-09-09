@@ -182,6 +182,8 @@ class Peer : NSObject, WebRTCEventHandler {
         return RTCPeerConnectionFactory(encoderFactory: videoEncoderFactory, decoderFactory: videoDecoderFactory)
     }()
 
+    private let connectionFactory: RTCPeerConnectionFactory
+
 
     @available(*, unavailable)
     override init() {
@@ -192,7 +194,9 @@ class Peer : NSObject, WebRTCEventHandler {
                   isAttach: Bool = false,
                   forceRelayCandidate: Bool = false,
                   useTrickleIce: Bool = false,
-                  isAnswering: Bool = false) {
+                  isAnswering: Bool = false,
+                  factory: RTCPeerConnectionFactory = Peer.factory) {
+        self.connectionFactory = factory
         self.configuredIceServers = iceServers
         self.isAnswering = isAnswering
 
@@ -213,7 +217,7 @@ class Peer : NSObject, WebRTCEventHandler {
 
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
                                               optionalConstraints: ["DtlsSrtpKeyAgreement": kRTCMediaConstraintsValueTrue])
-        self.connection = Peer.factory.peerConnection(with: config, constraints: constraints, delegate: nil)
+        self.connection = factory.peerConnection(with: config, constraints: constraints, delegate: nil)
 
         super.init()
         self.useTrickleIce = useTrickleIce
@@ -230,7 +234,7 @@ class Peer : NSObject, WebRTCEventHandler {
         let streamId = UUID.init().uuidString.lowercased()
 
         // Create local media stream
-        self._localStream = Peer.factory.mediaStream(withStreamId: streamId)
+        self._localStream = connectionFactory.mediaStream(withStreamId: streamId)
 
         // let's support Audio first.
         let audioTrack = self.createAudioTrack()
@@ -257,22 +261,21 @@ class Peer : NSObject, WebRTCEventHandler {
     ///
     /// This method runs asynchronously on a dedicated audio queue to prevent blocking.
     internal func configureAudioSession() {
+        // The application already owns the shared category, route and device
+        // when it opts into manual audio. A peer must not overwrite that owner.
+        guard !rtcAudioSession.useManualAudio else { return }
         self.audioQueue.async { [weak self] in
             guard let self = self else {
                 return
             }
             self.rtcAudioSession.lockForConfiguration()
+            defer { self.rtcAudioSession.unlockForConfiguration() }
+            // Ownership can change while this work waits on the audio queue.
+            guard !self.rtcAudioSession.useManualAudio else { return }
             do {
                 Logger.log.i(message: "Peer:: Configuring AVAudioSession")
                 self.rtcAudioSession.useManualAudio = true
-                // CallKit owns the audio-device lifetime when manual audio is
-                // enabled. Peer creation can finish after
-                // provider(_:didActivate:), so forcing the shared device off
-                // here races a valid answered call and leaves its local track
-                // sending digital silence. The device is disabled by default
-                // and the CallKit deactivation callback still disables it at
-                // the end of the call. Preserve the current owner state while
-                // this peer applies only its category and buffer settings.
+                // Preserve a device that CallKit has already activated.
                 try rtcAudioSession.setCategory(AVAudioSession.Category.playAndRecord,
                                                 mode: AVAudioSession.Mode.voiceChat,
                                                 options: [
@@ -286,20 +289,19 @@ class Peer : NSObject, WebRTCEventHandler {
             } catch let error {
                 Logger.log.e(message: "Peer:: Error changing AVAudioSession category: \(error.localizedDescription)")
             }
-            self.rtcAudioSession.unlockForConfiguration()
         }
     }
 
     private func createAudioTrack() -> RTCAudioTrack {
         let audioConstrains = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
-        let audioSource = Peer.factory.audioSource(with: audioConstrains)
+        let audioSource = connectionFactory.audioSource(with: audioConstrains)
         //TODO: trackId should be auto generated.
-        let audioTrack = Peer.factory.audioTrack(with: audioSource, trackId: AUDIO_TRACK_ID)
+        let audioTrack = connectionFactory.audioTrack(with: audioSource, trackId: AUDIO_TRACK_ID)
         return audioTrack
     }
 
     private func createVideoTrack() -> RTCVideoTrack {
-        let videoSource = Peer.factory.videoSource()
+        let videoSource = connectionFactory.videoSource()
         
         #if targetEnvironment(simulator)
             //if we are using the simulator:
@@ -310,7 +312,7 @@ class Peer : NSObject, WebRTCEventHandler {
             self.videoCapturer = RTCCameraVideoCapturer(delegate: videoSource)
         #endif
         //TODO: trackId should be auto generated.
-        let videoTrack = Peer.factory.videoTrack(with: videoSource, trackId: VIDEO_TRACK_ID)
+        let videoTrack = connectionFactory.videoTrack(with: videoSource, trackId: VIDEO_TRACK_ID)
         return videoTrack
     }
 
@@ -330,7 +332,7 @@ class Peer : NSObject, WebRTCEventHandler {
     ///
     /// - Parameter preferredCodecs: Array of TxCodecCapability objects representing the preferred codec order.
     ///   Each codec must match a supported codec by mimeType, clockRate, and optionally channels.
-    func applyAudioCodecPreferences(preferredCodecs: [TxCodecCapability]) {
+    func applyAudioCodecPreferences(preferredCodecs: [TxCodecCapability], preservingFallback: Bool = false) {
         guard let connection = self.connection else {
             Logger.log.w(message: "Peer:: applyAudioCodecPreferences() - No peer connection available")
             return
@@ -343,7 +345,7 @@ class Peer : NSObject, WebRTCEventHandler {
         }
 
         // Get all supported audio codec capabilities from the factory
-        let capabilities = Peer.factory.rtpSenderCapabilities(forKind: kRTCMediaStreamTrackKindAudio)
+        let capabilities = connectionFactory.rtpSenderCapabilities(forKind: kRTCMediaStreamTrackKindAudio)
         let allCodecs = capabilities.codecs
 
         // Match and order the codecs according to user preferences
@@ -351,7 +353,8 @@ class Peer : NSObject, WebRTCEventHandler {
 
         for preferredCodec in preferredCodecs {
             // Find matching RTCRtpCodecCapability from supported codecs
-            if let matchingCodec = allCodecs.first(where: { preferredCodec.matches($0) }) {
+            if let matchingCodec = allCodecs.first(where: { preferredCodec.matches($0) }),
+               !orderedCodecs.contains(matchingCodec) {
                 orderedCodecs.append(matchingCodec)
             }
         }
@@ -359,6 +362,10 @@ class Peer : NSObject, WebRTCEventHandler {
         guard !orderedCodecs.isEmpty else {
             Logger.log.w(message: "Peer:: applyAudioCodecPreferences() - No matching codecs found")
             return
+        }
+
+        if preservingFallback {
+            orderedCodecs.append(contentsOf: allCodecs.filter { !orderedCodecs.contains($0) })
         }
 
         // Apply the ordered codec preferences
@@ -385,6 +392,10 @@ class Peer : NSObject, WebRTCEventHandler {
     ///     - sdp: The generated session description, or nil if an error occurred
     ///     - error: An error if the offer creation failed, or nil on success
     func offer(preferredCodecs: [TxCodecCapability]? = nil, completion: @escaping (_ sdp: RTCSessionDescription?, _ error: Error?) -> Void) {
+        guard let connection = self.connection else {
+            completion(nil, NSError(domain: "TelnyxRTC.Peer", code: 1))
+            return
+        }
 
         // Apply codec preferences before creating offer
         if let codecs = preferredCodecs, !codecs.isEmpty {
@@ -395,7 +406,7 @@ class Peer : NSObject, WebRTCEventHandler {
                                              optionalConstraints: nil)
         self.negotiationEnded = false
         self.endOfCandidatesSent = false
-        self.connection?.offer(for: constrains) { (sdp, error) in
+        connection.offer(for: constrains) { (sdp, error) in
 
             if let error = error {
                 Logger.log.e(message: "Peer:: error creating offer \(error)")
@@ -405,12 +416,17 @@ class Peer : NSObject, WebRTCEventHandler {
 
             guard let sdp = sdp else {
                 Logger.log.w(message: "Peer:: SDP is missing")
+                completion(nil, NSError(domain: "TelnyxRTC.Peer", code: 2))
                 return
             }
 
             //Once we set the local description, the ICE negotiation starts and at least one ICE candidate should be created.
             //Check RTCPeerConnectionDelegate :: didGenerate candidate
-            self.connection?.setLocalDescription(sdp, completionHandler: { (error) in
+            connection.setLocalDescription(sdp, completionHandler: { (error) in
+                guard error == nil else {
+                    completion(nil, error)
+                    return
+                }
                 // For Trickle ICE, send the SDP immediately via delegate without waiting for candidates
                 if self.useTrickleIce {
                     Logger.log.i(message: "[TRICKLE-ICE] Peer:: offer() completed - sending SDP immediately without candidates (Trickle ICE mode)")
@@ -452,9 +468,17 @@ class Peer : NSObject, WebRTCEventHandler {
     ///   - completion: Callback invoked when the answer is created.
     ///     - sdp: The generated session description, or nil if an error occurred
     ///     - error: An error if the answer creation failed, or nil on success
-    func answer(callLegId: String, completion: @escaping (_ sdp: RTCSessionDescription?, _ error: Error?) -> Void) {
+    func answer(callLegId: String, preferredCodecs: [TxCodecCapability]? = nil, completion: @escaping (_ sdp: RTCSessionDescription?, _ error: Error?) -> Void) {
+        guard let connection = self.connection else {
+            completion(nil, NSError(domain: "TelnyxRTC.Peer", code: 1))
+            return
+        }
         self.negotiationEnded = false
         self.endOfCandidatesSent = false
+
+        if let codecs = preferredCodecs, !codecs.isEmpty {
+            applyAudioCodecPreferences(preferredCodecs: codecs, preservingFallback: true)
+        }
 
         let constrains = RTCMediaConstraints(mandatoryConstraints: self.mediaConstrains,
                                              optionalConstraints: nil)
@@ -462,7 +486,7 @@ class Peer : NSObject, WebRTCEventHandler {
         self.callLegID = callLegId
         Logger.log.i(message: "[TRICKLE-ICE] Peer:: answer() - callLegID received: \(callLegId) (note: using callId for trickle ICE)")
 
-        self.connection?.answer(for: constrains) { (sdp, error) in
+        connection.answer(for: constrains) { (sdp, error) in
 
             if let error = error {
                 Logger.log.e(message: "Peer:: error creating answer \(error)")
@@ -470,15 +494,19 @@ class Peer : NSObject, WebRTCEventHandler {
                 return
             }
 
-            //TODO: we should return an error. We don't have a local SDP
             guard let sdp = sdp else {
                 Logger.log.w(message: "Peer:: SDP is missing")
+                completion(nil, NSError(domain: "TelnyxRTC.Peer", code: 2))
                 return
             }
 
             //Once we set the local description, the ICE negotiation starts and at least one ICE candidate should be created.
             //Check RTCPeerConnectionDelegate :: didGenerate candidate
-            self.connection?.setLocalDescription(sdp, completionHandler: { (error) in
+            connection.setLocalDescription(sdp, completionHandler: { (error) in
+                guard error == nil else {
+                    completion(nil, error)
+                    return
+                }
                 // For Trickle ICE, send the SDP immediately via delegate without waiting for candidates
                 if self.useTrickleIce {
                     Logger.log.i(message: "[TRICKLE-ICE] Peer:: answer() completed - sending SDP immediately without candidates (Trickle ICE mode)")

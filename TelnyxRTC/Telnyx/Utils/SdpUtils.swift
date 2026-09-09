@@ -11,6 +11,130 @@ import Foundation
 /// Utility class for Session Description Protocol (SDP) manipulation.
 class SdpUtils {
 
+    /// WebRTC 124 selects its audio sender from the remote offer's payload
+    /// order. Transceiver preferences affect the answer and receiving direction.
+    /// Reorder only offered audio payloads in the local input to WebRTC, keeping
+    /// every fallback and attribute. Unknown or ambiguous sections stay intact.
+    static func preferringAudioCodecs(
+        in sdp: String,
+        preferredCodecs: [TxCodecCapability]
+    ) -> String {
+        guard !preferredCodecs.isEmpty, preferredCodecs.count <= 32,
+              preferredCodecs.allSatisfy({ $0.mimeType.utf8.count <= 70 }),
+              sdp.utf8.count <= 65_536 else { return sdp }
+        // Splitting on LF retains each line's optional CR and the final newline.
+        var lines = sdp.components(separatedBy: "\n")
+        guard lines.count <= 2_048 else { return sdp }
+        let mediaStarts = lines.indices.filter { lines[$0].hasPrefix("m=") }
+        for (section, start) in mediaStarts.enumerated() {
+            let end = section + 1 < mediaStarts.count ? mediaStarts[section + 1] : lines.count
+            if let reordered = preferringAudioPayloads(
+                in: lines[start], attributes: lines[(start + 1)..<end],
+                preferredCodecs: preferredCodecs
+            ) {
+                lines[start] = reordered
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private struct OfferedAudioCodec: Equatable {
+        let name: String
+        let clockRate: Int
+        let channels: Int
+
+        func matches(_ preferred: TxCodecCapability) -> Bool {
+            preferred.mimeType.lowercased() == "audio/" + name &&
+                preferred.clockRate == clockRate &&
+                (preferred.channels == nil || preferred.channels == channels)
+        }
+    }
+
+    private static func preferringAudioPayloads(
+        in rawLine: String,
+        attributes: ArraySlice<String>,
+        preferredCodecs: [TxCodecCapability]
+    ) -> String? {
+        let suffix = rawLine.hasSuffix("\r") ? "\r" : ""
+        let line = suffix.isEmpty ? rawLine : String(rawLine.dropLast())
+        let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard fields.count >= 4, fields.count <= 131, fields[0] == "m=audio",
+              fields[2].split(separator: "/").contains("RTP") else { return nil }
+        let port = fields[1].split(separator: "/", omittingEmptySubsequences: false)
+        guard port.count <= 2,
+              sdpInteger(port[0], in: 1...65_535) != nil else { return nil }
+        if port.count == 2, sdpInteger(port[1], in: 1...65_535) == nil { return nil }
+
+        let payloadFields = Array(fields.dropFirst(3))
+        let payloads = payloadFields.compactMap { sdpInteger($0, in: 0...127) }
+        guard payloads.count == payloadFields.count,
+              Set(payloads).count == payloads.count else { return nil }
+        // RFC 3551 mappings used by the supported telephony codecs. Explicit
+        // rtpmap values take precedence, including clock rate and channel count.
+        let staticCodecs: [Int: OfferedAudioCodec] = [
+            0: OfferedAudioCodec(name: "pcmu", clockRate: 8_000, channels: 1),
+            8: OfferedAudioCodec(name: "pcma", clockRate: 8_000, channels: 1),
+            9: OfferedAudioCodec(name: "g722", clockRate: 8_000, channels: 1),
+        ]
+        var mappings = staticCodecs.filter { payloads.contains($0.key) }
+        var explicitMappings: [Int: OfferedAudioCodec] = [:]
+        for rawAttribute in attributes {
+            let attribute = rawAttribute.hasSuffix("\r")
+                ? String(rawAttribute.dropLast()) : rawAttribute
+            guard attribute.hasPrefix("a=rtpmap:") else { continue }
+            let parts = attribute.dropFirst("a=rtpmap:".count)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard parts.count == 2,
+                  let payload = sdpInteger(parts[0], in: 0...127) else { return nil }
+            guard payloads.contains(payload) else { continue }
+            let format = parts[1].split(separator: "/", omittingEmptySubsequences: false)
+            guard (2...3).contains(format.count), !format[0].isEmpty,
+                  format[0].utf8.count <= 64,
+                  format[0].utf8.allSatisfy({ $0 > 32 && $0 < 127 }),
+                  let clockRate = sdpInteger(format[1], in: 1...384_000),
+                  let channels = format.count == 3
+                    ? sdpInteger(format[2], in: 1...24) : 1 else { return nil }
+            let codec = OfferedAudioCodec(
+                name: format[0].lowercased(), clockRate: clockRate, channels: channels
+            )
+            if let prior = explicitMappings[payload], prior != codec { return nil }
+            if let fixed = staticCodecs[payload], fixed.name != codec.name { return nil }
+            explicitMappings[payload] = codec
+            mappings[payload] = codec
+        }
+
+        var orderedIndices: [Int] = []
+        for preferred in preferredCodecs {
+            for index in payloads.indices where !orderedIndices.contains(index) {
+                if mappings[payloads[index]]?.matches(preferred) == true {
+                    orderedIndices.append(index)
+                }
+            }
+        }
+        guard !orderedIndices.isEmpty else { return nil }
+        orderedIndices.append(contentsOf: payloads.indices.filter { !orderedIndices.contains($0) })
+        guard orderedIndices != Array(payloads.indices) else { return nil }
+
+        // Keep the m line's prefix, spacing, payload spelling and trailing CR.
+        // Only move the payload tokens into their preferred positions.
+        var result = ""
+        var cursor = line.startIndex
+        for (position, field) in payloadFields.enumerated() {
+            result += line[cursor..<field.startIndex]
+            result += payloadFields[orderedIndices[position]]
+            cursor = field.endIndex
+        }
+        result += line[cursor...]
+        return result + suffix
+    }
+
+    private static func sdpInteger(_ text: Substring, in range: ClosedRange<Int>) -> Int? {
+        guard !text.isEmpty, text.utf8.count <= 6,
+              text.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let value = Int(text), range.contains(value) else { return nil }
+        return value
+    }
+
     /// Adds trickle ICE capability to an SDP if not already present.
     /// This adds "a=ice-options:trickle" at the session level after the origin (o=) line.
     ///

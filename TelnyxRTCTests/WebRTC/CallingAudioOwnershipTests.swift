@@ -137,6 +137,32 @@ final class CallingAudioOwnershipTests: XCTestCase {
         XCTAssertFalse(client.isSpeakerEnabled, "A delayed retry must respect manual audio ownership")
     }
 
+    func testDelayedPeerInitializationPreservesManualOwnerCategoryModeAndActivation() throws {
+        let session = AVAudioSession.sharedInstance()
+        let originalCategory = session.category
+        let originalMode = session.mode
+        let originalOptions = session.categoryOptions
+        defer { try? session.setCategory(originalCategory, mode: originalMode, options: originalOptions) }
+        let ownerOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker]
+        try session.setCategory(.playAndRecord, mode: .videoChat, options: ownerOptions)
+        rtc.isAudioEnabled = true
+        var latePeer: Peer?
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            latePeer = Peer(iceServers: [], isAnswering: true)
+        }
+        drainMainQueue(for: 0.3)
+        defer { latePeer?.dispose() }
+
+        XCTAssertNotNil(latePeer)
+        XCTAssertEqual(session.category, .playAndRecord)
+        XCTAssertEqual(session.mode, .videoChat, "Late peer setup must not replace the owner's mode")
+        XCTAssertEqual(session.categoryOptions, ownerOptions, "Late peer setup must preserve the owner's route options")
+        XCTAssertTrue(rtc.useManualAudio)
+        XCTAssertTrue(rtc.isAudioEnabled, "Late setup must preserve existing CallKit activation")
+        XCTAssertTrue(latePeer?.isAudioTrackEnabled == true)
+    }
+
     private func drainMainQueue(for interval: TimeInterval) {
         let drained = expectation(description: "Main queue callbacks completed")
         DispatchQueue.main.asyncAfter(deadline: .now() + interval) { drained.fulfill() }

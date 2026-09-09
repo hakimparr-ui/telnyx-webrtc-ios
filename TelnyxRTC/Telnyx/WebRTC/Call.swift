@@ -11,6 +11,17 @@ import WebRTC
 import AVFoundation
 
 
+/// The observed path that ended the SDK call. This does not identify who acted
+/// on the remote telephone network.
+public enum CallTerminationOrigin: String {
+    case localRequest
+    case queuedLocalAcknowledged
+    case remoteSignaling
+    case inviteTimeout
+    case negotiationFailure
+    case unspecified
+}
+
 /// Data class to hold detailed reasons for call termination.
 public struct CallTerminationReason {
     /// General cause description (e.g., "CALL_REJECTED").
@@ -23,13 +34,15 @@ public struct CallTerminationReason {
     public let sipReason: String?
     /// SIP Call-ID associated with the terminated call, when provided by the signaling server.
     public let sipCallId: String?
+    public let origin: CallTerminationOrigin
     
-    public init(cause: String? = nil, causeCode: Int? = nil, sipCode: Int? = nil, sipReason: String? = nil, sipCallId: String? = nil) {
+    public init(cause: String? = nil, causeCode: Int? = nil, sipCode: Int? = nil, sipReason: String? = nil, sipCallId: String? = nil, origin: CallTerminationOrigin = .unspecified) {
         self.cause = cause
         self.causeCode = causeCode
         self.sipCode = sipCode
         self.sipReason = sipReason
         self.sipCallId = sipCallId
+        self.origin = origin
     }
 }
 
@@ -206,6 +219,20 @@ public class Call {
 
     var direction: CallDirection = .OUTBOUND
     var peer: Peer?
+    private let peerFactory: RTCPeerConnectionFactory
+    private var answerPreferredCodecs: [TxCodecCapability]?
+    private let terminationLock = NSRecursiveLock()
+    private var terminationStarted = false
+
+    private var isTerminating: Bool {
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        return terminationStarted
+    }
+
+    internal var preferredAudioCodecs: [TxCodecCapability]? {
+        answerPreferredCodecs ?? callOptions?.preferredCodecs
+    }
     weak var socket: Socket?
     weak var delegate: CallProtocol?
     var iceServers: [RTCIceServer]
@@ -427,8 +454,10 @@ public class Call {
          callReportLogLevel: String = "debug",
          callReportMaxLogEntries: Int = 1000,
          pushWhenActive: Bool = false,
-         pushDeviceToken: String? = nil
+         pushDeviceToken: String? = nil,
+         peerFactory: RTCPeerConnectionFactory = Peer.factory
     ) {
+        self.peerFactory = peerFactory
         if isAttach {
             self.direction = CallDirection.ATTACH
         } else {
@@ -499,7 +528,9 @@ public class Call {
          callReportLogLevel: String = "debug",
          callReportMaxLogEntries: Int = 1000,
          pushWhenActive: Bool = false,
-         pushDeviceToken: String? = nil) {
+         pushDeviceToken: String? = nil,
+         peerFactory: RTCPeerConnectionFactory = Peer.factory) {
+        self.peerFactory = peerFactory
         self.direction = CallDirection.ATTACH
         //Session obtained after login with the signaling socket
         self.sessionId = sessionId
@@ -550,7 +581,9 @@ public class Call {
          callReportLogLevel: String = "debug",
          callReportMaxLogEntries: Int = 1000,
          pushWhenActive: Bool = false,
-         pushDeviceToken: String? = nil) {
+         pushDeviceToken: String? = nil,
+         peerFactory: RTCPeerConnectionFactory = Peer.factory) {
+        self.peerFactory = peerFactory
         //Session obtained after login with the signaling socket
         self.sessionId = sessionId
         //this is the signaling server socket
@@ -607,7 +640,7 @@ public class Call {
         // - Start the reporter once the peer connection is created
         self.configureStatsReporter()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Creating Peer for outbound call with useTrickleIce = \(self.useTrickleIce)")
-        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: false)
+        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: false, factory: peerFactory)
         self.startStatsReporter()
         self.peer?.delegate = self
         self.peer?.socket = self.socket
@@ -672,23 +705,89 @@ public class Call {
         })
     }
 
-    //TODO: We can move this inside the answer() function of the Peer class
-    private func incomingOffer(sdp: String) {
-        let remoteDescription = RTCSessionDescription(type: .offer, sdp: sdp)
-        self.peer?.connection?.setRemoteDescription(remoteDescription, completionHandler: { (error) in
-            guard let error = error else {
+    private func answerIncomingOffer(
+        sdp: String,
+        completion: @escaping (RTCSessionDescription) -> Void
+    ) {
+        guard let peer = self.peer, let connection = peer.connection else { return }
+        // WebRTC 124 selects the sending codec from the remote offer. Answer
+        // preferences alone control only what this peer receives. Keep the
+        // provider offer intact and order its local copy for the sending side.
+        let preferredCodecs = preferredAudioCodecs ?? []
+        let effectiveOffer = SdpUtils.preferringAudioCodecs(
+            in: sdp,
+            preferredCodecs: preferredCodecs
+        )
+        let remoteDescription = RTCSessionDescription(type: .offer, sdp: effectiveOffer)
+        connection.setRemoteDescription(remoteDescription) { [weak self, weak peer] error in
+            guard let self, let peer, self.peer === peer,
+                  peer.connection === connection,
+                  connection.signalingState != .closed,
+                  !self.isTerminating, self.callState != .DONE() else { return }
+            if let error {
+                self.failAnswerNegotiation(error)
                 return
             }
-            Logger.log.e(message: "Call:: Error setting remote description: \(error)")
-        })
+            peer.answer(
+                callLegId: self.telnyxLegId?.uuidString ?? "",
+                preferredCodecs: preferredCodecs
+            ) { [weak self, weak peer] answer, error in
+                guard let self, let peer, self.peer === peer,
+                      peer.connection === connection,
+                      connection.signalingState != .closed,
+                      !self.isTerminating, self.callState != .DONE() else { return }
+                if let error {
+                    self.failAnswerNegotiation(error)
+                    return
+                }
+                guard let answer else {
+                    self.failAnswerNegotiation(NSError(domain: "TelnyxRTC.Peer", code: 2))
+                    return
+                }
+                completion(answer)
+            }
+        }
     }
 
-    private func endCall(terminationReason: CallTerminationReason? = nil) {
+    private func failAnswerNegotiation(_ error: Error) {
+        Logger.log.e(message: "Call:: Audio negotiation failed: \(error)")
+        let cause = CauseCode.INCOMPATIBLE_DESTINATION
+        let bye = sessionId.map { sessionId in
+            ByeMessage(
+                sessionId: sessionId,
+                callId: signalingCallId.uuidString,
+                causeCode: cause,
+                sipCode: 488,
+                sipReason: "Call audio could not connect."
+            )
+        }
+        endCall(terminationReason: CallTerminationReason(
+            cause: ByeMessage.getCauseFromCode(causeCode: cause),
+            causeCode: cause.rawValue,
+            sipCode: 488,
+            sipReason: "Call audio could not connect.",
+            origin: .negotiationFailure
+        ), localBye: bye)
+    }
+
+    private func endCall(terminationReason: CallTerminationReason? = nil, localBye: ByeMessage? = nil) {
+        terminationLock.lock()
+        guard !terminationStarted else {
+            terminationLock.unlock()
+            return
+        }
+        terminationStarted = true
+        terminationLock.unlock()
+        if let localBye {
+            socket?.sendMessage(message: localBye.encode())
+        }
         // Reset benchmarking when call ends
         CallTimingBenchmark.reset()
 
         // Build context dict, filtering out nil values
-        var endCallContext: [String: AnyCodable] = [:]
+        var endCallContext: [String: AnyCodable] = [
+            "origin": AnyCodable((terminationReason?.origin ?? .unspecified).rawValue),
+        ]
         if let cause = terminationReason?.cause {
             endCallContext["cause"] = AnyCodable(cause)
         }
@@ -721,6 +820,17 @@ public class Call {
     }
 
     internal func updateCallState(callState: CallState) {
+        terminationLock.lock()
+        if case .DONE = callState {
+            if case .DONE = self.callState {
+                terminationLock.unlock()
+                return
+            }
+            terminationStarted = true
+        } else if terminationStarted {
+            terminationLock.unlock()
+            return
+        }
         Logger.log.i(message: "Call state updated: \(callState)")
         self.callState = callState
 
@@ -760,6 +870,7 @@ public class Call {
             break
         }
         
+        terminationLock.unlock()
         self.delegate?.callStateUpdated(call: self)
     }
 } // End Call class
@@ -797,9 +908,7 @@ extension Call {
         let (causeCode, terminationReason) = localTerminationDetails()
 
         let byeMessage = ByeMessage(sessionId: sessionId, callId: signalingCallId.uuidString, causeCode: causeCode)
-        let message = byeMessage.encode() ?? ""
-        self.socket?.sendMessage(message: message)
-        self.endCall(terminationReason: terminationReason)
+        self.endCall(terminationReason: terminationReason, localBye: byeMessage)
     }
 
     /// Queues a BYE on the supplied signaling socket without ending the call locally.
@@ -810,6 +919,7 @@ extension Call {
         using signalingSocket: Socket,
         sessionId: String
     ) -> String? {
+        guard !isTerminating, callState != .DONE() else { return nil }
         let (causeCode, _) = localTerminationDetails()
         let byeMessage = ByeMessage(
             sessionId: sessionId,
@@ -826,11 +936,11 @@ extension Call {
     /// Completes local teardown after the queued BYE has been acknowledged by the
     /// signaling server. Remote BYE handling remains an independent terminal path.
     internal func confirmQueuedHangup() {
-        let (_, terminationReason) = localTerminationDetails()
+        let (_, terminationReason) = localTerminationDetails(origin: .queuedLocalAcknowledged)
         self.endCall(terminationReason: terminationReason)
     }
 
-    private func localTerminationDetails() -> (CauseCode, CallTerminationReason) {
+    private func localTerminationDetails(origin: CallTerminationOrigin = .localRequest) -> (CauseCode, CallTerminationReason) {
         let causeCode: CauseCode
         switch callState {
         case .ACTIVE, .HELD:
@@ -844,7 +954,8 @@ extension Call {
             causeCode,
             CallTerminationReason(
                 cause: ByeMessage.getCauseFromCode(causeCode: causeCode),
-                causeCode: causeCode.rawValue
+                causeCode: causeCode.rawValue,
+                origin: origin
             )
         )
     }
@@ -873,7 +984,9 @@ extension Call {
     ///     converted to underscores in variable names.
     ///   - debug: (optional) Enable debug mode for call quality metrics and WebRTC statistics.
     ///     When enabled, real-time call quality metrics will be available through the `onCallQualityChange` callback.
-    public func answer(customHeaders:[String:String] = [:], debug:Bool = false) {
+    public func answer(customHeaders:[String:String] = [:], debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
+        guard !isTerminating, callState != .DONE() else { return }
+        self.answerPreferredCodecs = preferredCodecs
         // Start benchmarking for inbound calls when answer is called
         CallTimingBenchmark.start(isOutbound: false)
         CallTimingBenchmark.mark(CallBenchmarkMilestone.acceptCallStarted)
@@ -887,7 +1000,7 @@ extension Call {
         self.answerCustomHeaders = customHeaders
         self.configureStatsReporter()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Creating Peer for inbound call answer with useTrickleIce = \(self.useTrickleIce)")
-        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: true)
+        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: true, factory: peerFactory)
         self.enableQualityMetrics = debug
         self.startStatsReporter()
         self.peer?.delegate = self
@@ -897,32 +1010,21 @@ extension Call {
         self.peer?.callId = self.signalingCallId.uuidString.lowercased()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Peer callId set to \(self.signalingCallId.uuidString.lowercased()) for trickle ICE")
         self.setupPeerEventLogging()
-        self.incomingOffer(sdp: remoteSdp)
-        self.peer?.answer(callLegId: self.telnyxLegId?.uuidString ?? "", completion: { (sdp, error)  in
-            
+        self.answerIncomingOffer(sdp: remoteSdp) { [weak self] _ in
             CallTimingBenchmark.mark(CallBenchmarkMilestone.answerSdpSent)
-
-            if let error = error {
-                Logger.log.e(message: "Call:: Error creating the answering: \(error)")
-                return
-            }
-
-            guard let sdp = sdp else {
-                return
-            }
-            Logger.log.i(message: "Call:: Answer completed >> SDP: \(sdp)")
-            self.updateCallState(callState: .ACTIVE)
-        })
+            self?.updateCallState(callState: .ACTIVE)
+        }
     }
-    
-    
+
     /// Starts the process to answer the incoming call.
     /// ### Example:
     ///     call.answer()
     ///  - Parameters:
     ///         - customHeaders: (optional) Custom Headers to be passed over webRTC Messages, should be in the
     ///     format `X-key:Value` `X` is required for headers to be passed.
-    internal func acceptReAttach(peer: Peer?, customHeaders:[String:String] = [:],debug:Bool = false) {
+    internal func acceptReAttach(peer: Peer?, customHeaders:[String:String] = [:],debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
+        guard !isTerminating, callState != .DONE() else { return }
+        if let preferredCodecs { answerPreferredCodecs = preferredCodecs }
         //TODO: Create an error if there's no remote SDP
         guard let remoteSdp = self.remoteSdp else {
             return
@@ -938,7 +1040,8 @@ extension Call {
                          isAttach: true,
                          forceRelayCandidate: self.forceRelayCandidate,
                          useTrickleIce: self.useTrickleIce,
-                         isAnswering: false)
+                         isAnswering: false,
+                         factory: peerFactory)
         self.startStatsReporter()
         self.peer?.delegate = self
         self.peer?.socket = self.socket
@@ -947,19 +1050,9 @@ extension Call {
         self.peer?.callId = self.signalingCallId.uuidString.lowercased()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Peer callId set to \(self.signalingCallId.uuidString.lowercased()) for ATTACH")
         self.setupPeerEventLogging()
-        self.incomingOffer(sdp: remoteSdp)
-        self.peer?.answer(callLegId: self.telnyxLegId?.uuidString ?? "", completion: { (sdp, error)  in
-
-            if let error = error {
-                Logger.log.e(message: "Call:: Error creating the answering: \(error)")
-                return
-            }
-
-            guard let sdp = sdp else {
-                return
-            }
-            Logger.log.i(message: "Call:: Attach completed >> SDP: \(sdp)")
-        })
+        self.answerIncomingOffer(sdp: remoteSdp) { _ in
+            Logger.log.i(message: "Call:: Attach answer completed")
+        }
     }
     
     private func configureStatsReporter(reportID: UUID? = nil) {
@@ -1279,6 +1372,8 @@ extension Call : PeerDelegate {
     
     //If we received at least one ICE Candidate, then we can send the telnyx_rtc.invite message to start a call
     func onNegotiationEnded(sdp: RTCSessionDescription?) {
+        guard !isTerminating, callState != .DONE(),
+              peer?.connection?.signalingState != .closed else { return }
         
         guard let sdp = sdp,
               let sessionId = self.sessionId,
@@ -1360,28 +1455,16 @@ extension Call {
 
         switch message.method {
         case .BYE:
-            // Extract termination reason details from the message if available
-            var terminationReason: CallTerminationReason? = nil
-            
-            if let params = message.params {
-                let cause = params["cause"] as? String
-                let causeCode = params["causeCode"] as? Int
-                let sipCode = params["sipCode"] as? Int
-                let sipReason = params["sipReason"] as? String
-                let sipCallId = params["sip_call_id"] as? String
-                
-                // Only create a termination reason if we have at least one field
-                if cause != nil || causeCode != nil || sipCode != nil || sipReason != nil || sipCallId != nil {
-                    terminationReason = CallTerminationReason(
-                        cause: cause,
-                        causeCode: causeCode,
-                        sipCode: sipCode,
-                        sipReason: sipReason,
-                        sipCallId: sipCallId
-                    )
-                }
-            }
-            
+            let params = message.params
+            let terminationReason = CallTerminationReason(
+                cause: params?["cause"] as? String,
+                causeCode: params?["causeCode"] as? Int,
+                sipCode: params?["sipCode"] as? Int,
+                sipReason: params?["sipReason"] as? String,
+                sipCallId: params?["sip_call_id"] as? String,
+                origin: .remoteSignaling
+            )
+
             txClient.acceptRemoteTerminationEvidence(callId: callInfo?.callId)
             self.endCall(terminationReason: terminationReason)
             

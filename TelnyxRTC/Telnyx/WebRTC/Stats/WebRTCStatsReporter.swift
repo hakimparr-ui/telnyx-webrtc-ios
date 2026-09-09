@@ -1,5 +1,6 @@
 import WebRTC
 import Foundation
+import CoreFoundation
 
 /// The WebRTCStatsReporter class collects and reports WebRTC statistics and events
 /// to Telnyx's servers for debugging and quality monitoring purposes.
@@ -215,6 +216,44 @@ class WebRTCStatsReporter {
     /// - Parameter statsData: Dictionary containing WebRTC statistics
     /// - Returns: CallQualityMetrics object with calculated metrics
     private var previousStats: [String: Any]?
+
+    // Expose codec identity with the stream it describes. Never copy SDP, codec
+    // parameters or an unrelated stats object into application diagnostics.
+    internal static func resolvingAudioCodec(
+        _ audioStats: [String: Any],
+        from statistics: [String: Any]
+    ) -> [String: Any] {
+        var result = audioStats
+        var codec: [String: Any] = [
+            "mimeType": NSNull(),
+            "clockRate": NSNull(),
+            "channels": NSNull(),
+        ]
+        let mimeCharacters = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._+-"
+        )
+        if let codecId = audioStats["codecId"] as? String,
+           let source = statistics[codecId] as? [String: Any],
+           source["type"] as? String == "codec",
+           let mimeType = source["mimeType"] as? String,
+           mimeType.lowercased().hasPrefix("audio/"),
+           mimeType.utf8.count <= 64,
+           mimeType.unicodeScalars.allSatisfy({ mimeCharacters.contains($0) }) {
+            codec["mimeType"] = mimeType
+            for (key, maximum) in [("clockRate", 384_000.0), ("channels", 64.0)] {
+                if let number = source[key] as? NSNumber,
+                   CFGetTypeID(number) != CFBooleanGetTypeID(),
+                   number.doubleValue.isFinite,
+                   number.doubleValue >= 1,
+                   number.doubleValue <= maximum,
+                   number.doubleValue.rounded() == number.doubleValue {
+                    codec[key] = number.intValue
+                }
+            }
+        }
+        result["codec"] = codec
+        return result
+    }
 
     private func toRealTimeMetrics(inboundboundAudio: [[String: Any]], audio: [String: Any]) -> CallQualityMetrics {
         let audioContent = audio["audio"] as? [String: [[String: Any]]] ?? [:]
@@ -446,6 +485,15 @@ class WebRTCStatsReporter {
                     updatedStat["track"] = updatedMediaSource as NSObject
                     audioOutboundStats[index] = updatedStat as NSDictionary
                 }
+            }
+
+            audioInboundStats = audioInboundStats.compactMap { value in
+                guard let stats = value as? [String: Any] else { return nil }
+                return Self.resolvingAudioCodec(stats, from: statsObject)
+            }
+            audioOutboundStats = audioOutboundStats.compactMap { value in
+                guard let stats = value as? [String: Any] else { return nil }
+                return Self.resolvingAudioCodec(stats, from: statsObject)
             }
 
             // Retrieve the T01 stats and selectedCandidatePairId from the statsObject

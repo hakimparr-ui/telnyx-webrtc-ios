@@ -125,6 +125,8 @@ public extension Notification.Name {
 /// }
 /// ```
 public class TxClient {
+
+    internal var peerFactory: RTCPeerConnectionFactory = Peer.factory
     private struct PendingDisablePush {
         let messageId: String
         let generation: UInt
@@ -184,6 +186,7 @@ public class TxClient {
     private var isCallFromPush: Bool = false
     private var currentCallId: UUID = UUID()
     private var pendingAnswerHeaders = [String:String]()
+    private var pendingAnswerPreferredCodecs: [TxCodecCapability]?
     internal var sendFileLogs: Bool = false
     private var attachCallId: String?
     private var pushMetaData: [String:Any]?
@@ -1337,7 +1340,8 @@ public class TxClient {
     ///     When enabled, real-time call quality metrics will be available through the call's `onCallQualityChange` callback.
     public func answerFromCallkit(answerAction: CXAnswerCallAction,
                                   customHeaders: [String:String] = [:],
-                                  debug: Bool = false) {
+                                  debug: Bool = false,
+                                  preferredCodecs: [TxCodecCapability]? = nil) {
         Logger.log.i(message: "TxClient:: answerFromCallkit - started for callId: \(String(describing: answerAction.callUUID))")
         self.answerCallAction = answerAction
 
@@ -1346,6 +1350,7 @@ public class TxClient {
             Logger.log.i(message: "TxClient:: answerFromCallkit - Call initiated by push notification")
             /// Let's Keep track of the `customHeaders` passed
             pendingAnswerHeaders = customHeaders
+            pendingAnswerPreferredCodecs = preferredCodecs
             /// Set call quality metrics
             self.enableQualityMetrics = debug
 
@@ -1379,19 +1384,23 @@ public class TxClient {
         // If already connected and there's a pending INVITE, immediately accept the call
         if let currentCall = self.calls[currentCallId] {
             currentCall.answer(customHeaders: customHeaders,
-                               debug: debug)
+                               debug: debug,
+                               preferredCodecs: preferredCodecs)
             answerCallAction?.fulfill()
             resetPushVariables()
             Logger.log.i(message: "answered from callkit")
         } else {
             /// Let's Keep track of the `customHeaders` passed
             pendingAnswerHeaders = customHeaders
+            pendingAnswerPreferredCodecs = preferredCodecs
             /// Set call quality metrics
             self.enableQualityMetrics = debug
         }
     }
     
     private func resetPushVariables() {
+        pendingAnswerHeaders = [:]
+        pendingAnswerPreferredCodecs = nil
         answerCallAction = nil
         endCallAction = nil
         storedTxConfig = nil
@@ -1478,7 +1487,8 @@ public class TxClient {
             cause: "ORIGINATOR_CANCEL",
             causeCode: 487,
             sipCode: 487,
-            sipReason: "Request Terminated"
+            sipReason: "Request Terminated",
+            origin: .inviteTimeout
         )
         
         // Emit both delegate events to ensure proper CallKit termination
@@ -2182,7 +2192,8 @@ extension TxClient {
                         callReportLogLevel: self.txConfig?.callReportLogLevel ?? "debug",
                         callReportMaxLogEntries: self.txConfig?.callReportMaxLogEntries ?? 1000,
                         pushWhenActive: self.txConfig?.pushWhenActive ?? false,
-                        pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken)
+                        pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken,
+                        peerFactory: peerFactory)
         call.newCall(callerName: callerName,
                      callerNumber: callerNumber,
                      destinationNumber: destinationNumber,
@@ -2266,6 +2277,10 @@ extension TxClient {
             signalingCallId = callId
         }
 
+        let reattachedPreferredCodecs = isAttach
+            ? self.calls[appFacingCallId]?.preferredAudioCodecs
+            : nil
+
         // Remove placeholder call if it exists from processVoIPNotification
         if appFacingCallId != signalingCallId {
             self.calls.removeValue(forKey: appFacingCallId)
@@ -2294,7 +2309,8 @@ extension TxClient {
                         callReportLogLevel: self.txConfig?.callReportLogLevel ?? "debug",
                         callReportMaxLogEntries: self.txConfig?.callReportMaxLogEntries ?? 1000,
                         pushWhenActive: self.txConfig?.pushWhenActive ?? false,
-                        pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken)
+                        pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken,
+                        peerFactory: peerFactory)
         call.callInfo?.callerName = callerName
         call.callInfo?.callerNumber = callerNumber
         call.callOptions = TxCallOptions(audio: true)
@@ -2307,7 +2323,11 @@ extension TxClient {
         
         if isAttach {
             Logger.log.i(message: "TxClient :: Attaching Call....")
-            call.acceptReAttach(peer: nil,debug: enableQualityMetrics)
+            call.acceptReAttach(
+                peer: nil,
+                debug: enableQualityMetrics,
+                preferredCodecs: reattachedPreferredCodecs
+            )
             return
         }
 
@@ -2334,7 +2354,7 @@ extension TxClient {
             self.delegate?.onPushCall(call: call)
             //Answer is pending from push - Answer Call
             if(answerCallAction != nil){
-                call.answer(customHeaders: pendingAnswerHeaders,debug: enableQualityMetrics)
+                call.answer(customHeaders: pendingAnswerHeaders, debug: enableQualityMetrics, preferredCodecs: pendingAnswerPreferredCodecs)
                 answerCallAction?.fulfill()
                 resetPushVariables()
             }
@@ -2419,7 +2439,8 @@ extension TxClient {
                                                callReportLogLevel: self.txConfig?.callReportLogLevel ?? "debug",
                                                callReportMaxLogEntries: self.txConfig?.callReportMaxLogEntries ?? 1000,
                                                pushWhenActive: self.storedTxConfig?.pushWhenActive ?? false,
-                                               pushDeviceToken: self.storedTxConfig?.pushNotificationConfig?.pushDeviceToken)
+                                               pushDeviceToken: self.storedTxConfig?.pushNotificationConfig?.pushDeviceToken,
+                                               peerFactory: peerFactory)
                     self.currentCallId = callUUID
                 } else {
                     Logger.log.e(message: "TxClient:: processVoIPNotification - Invalid call_id, socket, or ICE servers. Cannot create call object.")
