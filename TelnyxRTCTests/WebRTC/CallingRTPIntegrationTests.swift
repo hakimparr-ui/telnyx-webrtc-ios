@@ -124,6 +124,54 @@ final class CallingRTPIntegrationTests: XCTestCase {
         try assertTerminal(origin: .localRequest)
     }
 
+    func testRealPCMUReporterEmitsAdvancingCumulativeMediaThroughAppProjection() throws {
+        try connectIncoming(offeredCodecs: ["PCMU"], preferredCodecs: appPreferences, expectedCodec: "PCMU")
+        let incoming = try XCTUnwrap(call)
+        let reporter = WebRTCStatsReporter(socket: try XCTUnwrap(socket))
+        defer {
+            incoming.onCallQualityChange = nil
+            reporter.dispose()
+        }
+        incoming.enableQualityMetrics = true
+        var samples: [[String: Any]] = []
+        incoming.onCallQualityChange = { metrics in
+            let sample = TelnyxPstnNativeQualitySnapshot.diagnosticMediaStats(
+                inbound: metrics.inboundAudio, outbound: metrics.outboundAudio,
+                remoteInbound: metrics.remoteInboundAudio
+            )
+            DispatchQueue.main.async {
+                samples.append(sample)
+                if samples.count > 30 { samples.removeFirst() }
+            }
+        }
+        reporter.startDebugReport(peerId: try XCTUnwrap(incoming.callInfo?.callId), call: incoming)
+        defer {
+            measurements.append(["event": "real reporter cumulative media", "samples": Array(samples.suffix(3))])
+        }
+        try waitUntil("real cumulative source and selected transport statistics", timeout: 5) {
+            guard samples.count >= 2,
+                  let first = samples.first?["outbound"] as? [String: Any],
+                  let last = samples.last?["outbound"] as? [String: Any],
+                  let firstSource = first["source"] as? [String: Any],
+                  let lastSource = last["source"] as? [String: Any],
+                  let firstDuration = firstSource["totalSamplesDuration"] as? NSNumber,
+                  let lastDuration = lastSource["totalSamplesDuration"] as? NSNumber,
+                  let firstEnergy = firstSource["totalAudioEnergy"] as? NSNumber,
+                  let lastEnergy = lastSource["totalAudioEnergy"] as? NSNumber,
+                  let firstTime = firstSource["timestampMs"] as? NSNumber,
+                  let lastTime = lastSource["timestampMs"] as? NSNumber,
+                  let transport = last["transport"] as? [String: Any] else { return false }
+            return lastDuration.doubleValue > firstDuration.doubleValue &&
+                lastEnergy.doubleValue > firstEnergy.doubleValue &&
+                lastTime.doubleValue > firstTime.doubleValue &&
+                transport["localProtocol"] as? String == "udp" &&
+                transport["remoteProtocol"] as? String == "udp" &&
+                transport["localCandidateType"] is String && transport["remoteCandidateType"] is String
+        }
+        incoming.hangup()
+        try assertTerminal(origin: .localRequest)
+    }
+
     func testTraditionalIncomingWithHostCandidatesAndNoIceServersCanSendAnswer() throws {
         // An explicitly empty ICE configuration is separate from the app's
         // configured STUN path. Keep this fallback regression identifiable.
