@@ -127,10 +127,14 @@ final class CallingRTPIntegrationTests: XCTestCase {
     func testRealPCMUReporterEmitsAdvancingCumulativeMediaThroughAppProjection() throws {
         try connectIncoming(offeredCodecs: ["PCMU"], preferredCodecs: appPreferences, expectedCodec: "PCMU")
         let incoming = try XCTUnwrap(call)
-        let reporter = WebRTCStatsReporter(socket: try XCTUnwrap(socket))
+        let signaling = try XCTUnwrap(socket)
+        signaling.connect(signalingServer: try XCTUnwrap(URL(string: "wss://127.0.0.1")))
+        XCTAssertTrue(signaling.isConnected, "The in process signaling stub must be connected for reporting")
+        let reporter = WebRTCStatsReporter(socket: signaling)
         defer {
             incoming.onCallQualityChange = nil
             reporter.dispose()
+            signaling.disconnect(reconnect: false)
         }
         incoming.enableQualityMetrics = true
         var samples: [[String: Any]] = []
