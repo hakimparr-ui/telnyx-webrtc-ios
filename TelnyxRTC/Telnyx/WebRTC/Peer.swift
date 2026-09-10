@@ -568,31 +568,37 @@ class Peer : NSObject, WebRTCEventHandler {
         // Traditional non-trickle ICE: wait for candidates to accumulate
         Logger.log.i(message: "Peer:: ICE negotiation updated (traditional mode)")
 
-        //Restart the negotiation timer
-        self.negotiationTimer?.invalidate()
-        self.negotiationTimer = nil
-        DispatchQueue.main.async {
-            self.negotiationTimer = Timer.scheduledTimer(withTimeInterval: self.NEGOTIATION_TIMOUT, repeats: false) { timer in
-                // Check if the negotiation process has ended to avoid duplicated calls to the delegate method.
-                if self.negotiationEnded {
-                    Logger.log.w(message: "ICE negotiation has ended:: For Peer")
-                    return
-                }
-                self.negotiationTimer?.invalidate()
-                self.negotiationEnded = true
-
-                // Handle ICE restart completion
-                if self.isIceRestarting, let completion = self.iceRestartCompletion {
-                    self.iceRestartCompletion = nil
-                    self.createFinalOfferWithCandidates(completion: completion)
-                } else {
-                    // At this moment we should have at least one ICE candidate.
-                    // Lets stop the ICE negotiation process and call the apropiate delegate
-                    self.delegate?.onNegotiationEnded(sdp: peerConnection.localDescription)
-                }
-                Logger.log.i(message: "Peer:: ICE negotiation ended.")
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection,
+                  self.connection === peerConnection,
+                  peerConnection.signalingState != .closed,
+                  !self.negotiationEnded else { return }
+            self.negotiationTimer?.invalidate()
+            self.negotiationTimer = Timer.scheduledTimer(withTimeInterval: self.NEGOTIATION_TIMOUT, repeats: false) { [weak self, weak peerConnection] _ in
+                guard let self, let peerConnection else { return }
+                self.completeTraditionalNegotiation(peerConnection: peerConnection)
             }
         }
+    }
+
+    // Complete the final traditional SDP once on the main queue.
+    private func completeTraditionalNegotiation(peerConnection: RTCPeerConnection) {
+        guard !useTrickleIce, connection === peerConnection,
+              peerConnection.signalingState != .closed,
+              peerConnection.connectionState != .closed,
+              !negotiationEnded,
+              let localDescription = peerConnection.localDescription else { return }
+        negotiationEnded = true
+        negotiationTimer?.invalidate()
+        negotiationTimer = nil
+
+        if isIceRestarting, let completion = iceRestartCompletion {
+            iceRestartCompletion = nil
+            createFinalOfferWithCandidates(completion: completion)
+        } else {
+            delegate?.onNegotiationEnded(sdp: localDescription)
+        }
+        Logger.log.i(message: "Peer:: ICE negotiation ended.")
     }
 
     /// Close connection and release resources
@@ -1081,7 +1087,8 @@ extension Peer : RTCPeerConnectionDelegate {
         // Attempting to add candidates manually causes "The remote description was null" error
 
         // Start negotiation timer for traditional ICE mode:
-        // Only start timer when an ICE candidate from the configured STUN or TURN server is gathered
+        // Wait for a configured STUN or TURN server, or use host candidates when
+        // the caller explicitly supplied no servers.
         if !useTrickleIce {
 
             gatheredICECandidates.append(candidate.serverUrl ?? "")
@@ -1090,7 +1097,7 @@ extension Peer : RTCPeerConnectionDelegate {
             // Extract server URLs from the configured ice servers for this peer connection
             let configuredServerUrls = configuredIceServers.flatMap { $0.urlStrings }
 
-            if gatheredICECandidates.contains(where: { gatheredUrl in
+            if configuredServerUrls.isEmpty || gatheredICECandidates.contains(where: { gatheredUrl in
                 configuredServerUrls.contains { configuredUrl in
                     // Extract the base URL without transport parameters for comparison
                     let gatheredBase = gatheredUrl.components(separatedBy: "?").first ?? gatheredUrl

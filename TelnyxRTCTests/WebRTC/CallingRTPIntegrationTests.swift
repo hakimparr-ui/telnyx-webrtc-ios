@@ -14,6 +14,7 @@ final class CallingRTPIntegrationTests: XCTestCase {
     private var socket: LocalSignalingSocket?
     private var observer: CallStateRecorder?
     private var client: TxClient?
+    private var localSTUN: CallingLocalSTUNServer?
     private var measurements: [[String: Any]] = []
     private var connectedAt: TimeInterval = 0
     private var originalManual = false
@@ -55,6 +56,12 @@ final class CallingRTPIntegrationTests: XCTestCase {
         if let device = remoteDevice { XCTAssertTrue(device.stopAndWait(3), "Remote PCM thread must exit") }
         localDevice = nil
         remoteDevice = nil
+        if let server = localSTUN {
+            let evidence = server.snapshot()
+            XCTAssertTrue(server.stopAndWait(3), "Every owned STUN and mapped UDP listener must close")
+            measurements.append(["event": "local STUN fixture stopped", "listeners": evidence])
+        }
+        localSTUN = nil
 
         let rtc = RTCAudioSession.sharedInstance()
         rtc.lockForConfiguration()
@@ -115,6 +122,30 @@ final class CallingRTPIntegrationTests: XCTestCase {
         try assertAudioWindow(label: "initial incoming preference", duration: 2, expectedCodec: "opus")
         call?.hangup()
         try assertTerminal(origin: .localRequest)
+    }
+
+    func testTraditionalIncomingWithHostCandidatesAndNoIceServersCanSendAnswer() throws {
+        // An explicitly empty ICE configuration is separate from the app's
+        // configured STUN path. Keep this fallback regression identifiable.
+        try connectIncoming(offeredCodecs: ["PCMU"], preferredCodecs: appPreferences,
+                            expectedCodec: "PCMU", configuredSTUN: false)
+        try assertAudioWindow(label: "traditional host fallback", duration: 2, expectedCodec: "PCMU")
+        let completedPeer = try XCTUnwrap(call?.peer)
+        let completedConnection = try XCTUnwrap(completedPeer.connection)
+        let candidateSDP = try XCTUnwrap(completedConnection.localDescription?.sdp.components(separatedBy: .newlines)
+            .first { $0.hasPrefix("a=candidate:") })
+        let lateCandidate = RTCIceCandidate(sdp: String(candidateSDP.dropFirst(2)), sdpMLineIndex: 0, sdpMid: "0")
+        completedPeer.peerConnection(completedConnection, didGenerate: lateCandidate)
+        completedPeer.peerConnection(completedConnection, didGenerate: lateCandidate)
+        drain(for: 0.5)
+        XCTAssertEqual(socket?.methods.filter { $0 == .ANSWER }.count, 1,
+                       "Repeated host candidates must not send another answer")
+        call?.hangup()
+        try assertTerminal(origin: .localRequest)
+        completedPeer.peerConnection(completedConnection, didGenerate: lateCandidate)
+        drain(for: 0.5)
+        XCTAssertEqual(socket?.methods.filter { $0 == .ANSWER }.count, 1,
+                       "A late host candidate must not answer an ended call")
     }
 
     func testAttachDispatcherRetainsStoredCodecPreferenceOnReplacementCall() throws {
@@ -210,7 +241,19 @@ final class CallingRTPIntegrationTests: XCTestCase {
     }
 
     private func connectIncoming(offeredCodecs: [String], preferredCodecs: [TxCodecCapability]?, expectedCodec: String,
-                                 remoteByeWhileAnswerPending: Bool = false, attachThroughClient: Bool = false) throws {
+                                 remoteByeWhileAnswerPending: Bool = false, attachThroughClient: Bool = false,
+                                 configuredSTUN: Bool = true) throws {
+        // Match the application's TxConfig default. The server stays in this
+        // test process and supplies real binding responses and UDP mappings.
+        let useTrickleIce = false
+        let iceServers: [RTCIceServer]
+        if configuredSTUN {
+            let server = try CallingLocalSTUNServer()
+            localSTUN = server
+            iceServers = [RTCIceServer(urlStrings: [server.url])]
+        } else {
+            iceServers = []
+        }
         let localAudio = CallingSyntheticAudioDevice(toneFrequency: 600, expectedFrequency: 1100)
         let remoteAudio = CallingSyntheticAudioDevice(toneFrequency: 1100, expectedFrequency: 600)
         localDevice = localAudio
@@ -264,6 +307,7 @@ final class CallingRTPIntegrationTests: XCTestCase {
         var answerSet = false
         var answerReceived = false
         var wireAnswerSDP: String?
+        var answerHadCandidates = false
         var pendingCandidates: [RTCIceCandidate] = []
         var candidateErrors: [String] = []
         func addCandidate(_ candidate: RTCIceCandidate) {
@@ -275,6 +319,8 @@ final class CallingRTPIntegrationTests: XCTestCase {
             if (message.method == .ANSWER || message.method == .ATTACH), let sdp = message.params?["sdp"] as? String {
                 answerReceived = true
                 wireAnswerSDP = sdp
+                answerHadCandidates = sdp.components(separatedBy: .newlines).contains { $0.hasPrefix("a=candidate:") }
+                XCTAssertTrue(answerHadCandidates, "Traditional signaling must carry gathered candidates in the actual answer")
                 offeringPeer.setRemoteDescription(RTCSessionDescription(type: .answer, sdp: sdp)) { error in
                     DispatchQueue.main.async {
                         negotiationError = error
@@ -285,15 +331,16 @@ final class CallingRTPIntegrationTests: XCTestCase {
                 }
             } else if message.method == .CANDIDATE,
                       let sdp = message.params?["candidate"] as? String,
-                      let line = message.params?["sdpMLineIndex"] as? NSNumber {
+                       let line = message.params?["sdpMLineIndex"] as? NSNumber {
+                XCTFail("The app's traditional ICE mode must not rely on separate CANDIDATE messages")
                 let candidate = RTCIceCandidate(sdp: sdp, sdpMLineIndex: line.int32Value,
                                                sdpMid: message.params?["sdpMid"] as? String)
                 if answerSet { addCandidate(candidate) } else { pendingCandidates.append(candidate) }
             }
         }
         var incoming = Call(callId: UUID(), remoteSdp: completeOffer.sdp, sessionId: "local-session",
-                            socket: signaling, delegate: stateObserver, iceServers: [], isAttach: false,
-                            useTrickleIce: true, enableCallReports: false, peerFactory: incomingFactory)
+                            socket: signaling, delegate: stateObserver, iceServers: iceServers, isAttach: false,
+                            useTrickleIce: useTrickleIce, enableCallReports: false, peerFactory: incomingFactory)
         incoming.callOptions = TxCallOptions()
         call = incoming
         if attachThroughClient {
@@ -309,8 +356,8 @@ final class CallingRTPIntegrationTests: XCTestCase {
             dispatcher.socketFactory = { signaling }
             try dispatcher.connect(
                 txConfig: TxConfig(sipUser: "synthetic-user", password: "synthetic-only",
-                                   useTrickleIce: true, enableCallReports: false),
-                serverConfiguration: TxServerConfiguration(signalingServer: URL(string: "wss://127.0.0.1"), webRTCIceServers: [])
+                                   useTrickleIce: useTrickleIce, enableCallReports: false),
+                serverConfiguration: TxServerConfiguration(signalingServer: URL(string: "wss://127.0.0.1"), webRTCIceServers: iceServers)
             )
             dispatcher.calls[previousID] = previous
             let attachData = try JSONSerialization.data(withJSONObject: [
@@ -345,6 +392,9 @@ final class CallingRTPIntegrationTests: XCTestCase {
         let negotiation: [String: Any] = [
             "event": "codec negotiation",
             "path": attachThroughClient ? "attach" : "incoming answer",
+            "useTrickleIce": useTrickleIce,
+            "answerHadCandidates": answerHadCandidates,
+            "separateCandidateMessages": signaling.methods.filter { $0 == .CANDIDATE }.count,
             "originalOffer": audioPayloadOrder(completeOffer.sdp),
             "effectiveOffer": audioPayloadOrder(effectiveOffer.sdp),
             "answer": audioPayloadOrder(answerSDP)
@@ -352,6 +402,16 @@ final class CallingRTPIntegrationTests: XCTestCase {
         measurements.append(negotiation)
         emitSanitizedEvidence(negotiation, prefix: "CALLING_CODEC_NEGOTIATION")
         XCTAssertTrue(answerReceived, "The remote peer must consume the SDK's actual answer message")
+        XCTAssertEqual(signaling.methods.filter { $0 == .ANSWER || $0 == .ATTACH }.count, 1,
+                       "Traditional gathering must send one final answer")
+        XCTAssertEqual(signaling.methods.filter { $0 == .CANDIDATE }.count, 0)
+        if let server = localSTUN {
+            let binding = server.snapshot()
+            XCTAssertGreaterThan(binding["bindingResponses"] as? Int ?? 0, 0,
+                                 "Configured mode must perform a real STUN transaction")
+            XCTAssertEqual(binding["errors"] as? Int, 0)
+            measurements.append(["event": "configured STUN answered", "fixture": binding])
+        }
         XCTAssertTrue(candidateErrors.isEmpty, "Local ICE delivery failed: \(candidateErrors)")
         XCTAssertEqual(incoming.callState, .ACTIVE)
         try waitForInitialRTP()

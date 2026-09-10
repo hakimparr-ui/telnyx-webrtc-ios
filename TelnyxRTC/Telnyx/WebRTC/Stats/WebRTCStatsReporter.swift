@@ -255,6 +255,63 @@ class WebRTCStatsReporter {
         return result
     }
 
+    // Resolve only this sender's references. This reserved projection contains
+    // no candidate addresses, credentials, SDP, track IDs or recorded audio.
+    internal static func resolvingOutboundAudioDiagnostics(
+        _ audioStats: [String: Any],
+        from statistics: [String: Any]
+    ) -> [String: Any] {
+        func referenced(_ id: Any?, type: String) -> [String: Any]? {
+            guard let id = id as? String,
+                  let stats = statistics[id] as? [String: Any],
+                  stats["type"] as? String == type else { return nil }
+            return stats
+        }
+        func measurement(_ value: Any?) -> Any {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite,
+                  number.doubleValue >= 0,
+                  number.doubleValue <= 9_007_199_254_740_991 else {
+                return NSNull()
+            }
+            return number
+        }
+        func choice(_ value: Any?, allowed: Set<String>) -> Any {
+            guard let value = value as? String, allowed.contains(value) else {
+                return NSNull()
+            }
+            return value
+        }
+        let source = referenced(audioStats["mediaSourceId"], type: "media-source")
+        let audioSource = source?["kind"] as? String == "audio" ? source : nil
+        let transport = referenced(audioStats["transportId"], type: "transport")
+        let pair = referenced(transport?["selectedCandidatePairId"], type: "candidate-pair")
+        let local = referenced(pair?["localCandidateId"], type: "local-candidate")
+        let remote = referenced(pair?["remoteCandidateId"], type: "remote-candidate")
+        let protocols: Set<String> = ["udp", "tcp"]
+        let candidateTypes: Set<String> = ["host", "srflx", "prflx", "relay"]
+        var result = audioStats
+        // Replace the namespace even when a reference has disappeared so a
+        // prior sender or selected pair can never supply stale measurements.
+        result["_uosDiagnostics"] = [
+            "source": [
+                "timestamp": measurement(audioSource?["timestamp"]),
+                "totalAudioEnergy": measurement(audioSource?["totalAudioEnergy"]),
+                "totalSamplesDuration": measurement(audioSource?["totalSamplesDuration"]),
+            ],
+            "transport": [
+                "timestamp": measurement(pair?["timestamp"]),
+                "currentRoundTripTime": measurement(pair?["currentRoundTripTime"]),
+                "localProtocol": choice(local?["protocol"], allowed: protocols),
+                "remoteProtocol": choice(remote?["protocol"], allowed: protocols),
+                "localCandidateType": choice(local?["candidateType"], allowed: candidateTypes),
+                "remoteCandidateType": choice(remote?["candidateType"], allowed: candidateTypes),
+            ],
+        ]
+        return result
+    }
+
     private func toRealTimeMetrics(inboundboundAudio: [[String: Any]], audio: [String: Any]) -> CallQualityMetrics {
         let audioContent = audio["audio"] as? [String: [[String: Any]]] ?? [:]
         let inbound = audioContent["inbound"] ?? []
@@ -493,7 +550,8 @@ class WebRTCStatsReporter {
             }
             audioOutboundStats = audioOutboundStats.compactMap { value in
                 guard let stats = value as? [String: Any] else { return nil }
-                return Self.resolvingAudioCodec(stats, from: statsObject)
+                let resolved = Self.resolvingAudioCodec(stats, from: statsObject)
+                return Self.resolvingOutboundAudioDiagnostics(resolved, from: statsObject)
             }
 
             // Retrieve the T01 stats and selectedCandidatePairId from the statsObject
