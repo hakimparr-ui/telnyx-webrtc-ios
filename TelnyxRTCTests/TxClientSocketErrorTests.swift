@@ -202,14 +202,19 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertTrue(socket.sentMessages.isEmpty)
         socket.emitConnected()
         XCTAssertEqual(socketCount, 1)
-        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertEqual(loginMessages(socket).count, 1)
+        let login = try XCTUnwrap(loginMessages(socket).first?["params"] as? [String: Any])
+        XCTAssertEqual(login["from_push"] as? Bool, true)
+        let loginParams = try XCTUnwrap(login["loginParams"] as? [String: Any])
+        XCTAssertEqual(loginParams["attach_call"] as? String, "true")
+        XCTAssertNil(loginParams["decline_push"])
         XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
         XCTAssertNil(txClient.calls[callId]?.peer)
         XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
         let answer = TrackingAnswerCallAction(call: callId)
         txClient.answerFromCallkit(answerAction: answer)
         XCTAssertEqual(socketCount, 1)
-        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertEqual(loginMessages(socket).count, 1)
         XCTAssertEqual(answer.fulfillCallCount, 0)
         XCTAssertEqual(answer.failCallCount, 0)
     }
@@ -230,7 +235,7 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertTrue(txClient.calls[appId] === call)
         XCTAssertEqual(call.callInfo?.callerNumber, "+447700900123")
         XCTAssertNil(call.peer)
-        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertEqual(loginMessages(socket).count, 1)
     }
 
     func testPassiveDiscoveryTimeoutDoesNotCreateMediaOrAnswerAction() throws {
@@ -348,7 +353,7 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(oldSocket.sentMessages.count, oldMessageCount)
         XCTAssertTrue(newSocket.sentMessages.isEmpty)
         newSocket.emitConnected()
-        XCTAssertEqual(newSocket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertEqual(loginMessages(newSocket).count, 1)
         txClient.onMessageReceived(socket: oldSocket, message: try incomingIdentityMessage(
             method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
         ))
@@ -1004,6 +1009,13 @@ class TxClientPingAuthTests: XCTestCase {
             mockDelegate.pushDisabledResults.first?.message,
             "socket error before push notifications were disabled"
         )
+    }
+
+    private func loginMessages(_ socket: ActiveTerminationTestSocket) -> [[String: Any]] {
+        socket.sentMessages.compactMap { message -> [String: Any]? in
+            guard let data = message.data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }.filter { $0["method"] as? String == "login" }
     }
 
     private func startPushFlow(callId: UUID, authenticateForInvite: Bool = false) throws {
