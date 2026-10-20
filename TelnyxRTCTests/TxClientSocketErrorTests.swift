@@ -7,6 +7,7 @@
 
 import XCTest
 import CallKit
+import WebRTC
 @testable import TelnyxRTC
 
 /// Tests verifying that the SDK does not reply to server pings on an
@@ -16,9 +17,16 @@ class TxClientPingAuthTests: XCTestCase {
 
     var txClient: TxClient!
     var mockDelegate: PingTestDelegate!
+    private var originalManualAudio = false
+    private var originalAudioEnabled = false
 
     override func setUp() {
         super.setUp()
+        let audio = RTCAudioSession.sharedInstance()
+        originalManualAudio = audio.useManualAudio
+        originalAudioEnabled = audio.isAudioEnabled
+        audio.useManualAudio = true
+        audio.isAudioEnabled = false
         txClient = TxClient()
         mockDelegate = PingTestDelegate()
         txClient.delegate = mockDelegate
@@ -26,8 +34,13 @@ class TxClientPingAuthTests: XCTestCase {
 
     override func tearDown() {
         txClient.delegate = nil
+        for call in Array(txClient.calls.values) { call.peer?.dispose() }
+        txClient.disconnect()
         txClient = nil
         mockDelegate = nil
+        let audio = RTCAudioSession.sharedInstance()
+        audio.isAudioEnabled = originalAudioEnabled
+        audio.useManualAudio = originalManualAudio
         super.tearDown()
     }
 
