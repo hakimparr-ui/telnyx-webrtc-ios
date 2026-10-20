@@ -180,6 +180,173 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(answerAction.failCallCount, 0)
     }
 
+    func testPassivePushAuthenticatesBeforeAnswerOnTheExistingSocket() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var socketCount = 0
+        txClient.socketFactory = { socketCount += 1; return socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId, authenticateForInvite: true)
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+        socket.emitConnected()
+        XCTAssertEqual(socketCount, 1)
+        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+        XCTAssertNil(txClient.calls[callId]?.peer)
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+        let answer = TrackingAnswerCallAction(call: callId)
+        txClient.answerFromCallkit(answerAction: answer)
+        XCTAssertEqual(socketCount, 1)
+        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        XCTAssertEqual(answer.fulfillCallCount, 0)
+        XCTAssertEqual(answer.failCallCount, 0)
+    }
+
+    func testPassivePushHandlesSynchronousSocketAndInviteWithoutRestoringPlaceholder() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let appId = UUID()
+        let invite = try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
+        )
+        txClient.socketFactory = { socket }
+        socket.onConnect = {
+            socket.emitConnected()
+            self.txClient.onMessageReceived(message: invite)
+        }
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        let call = try XCTUnwrap(mockDelegate.pushCalls.first)
+        XCTAssertTrue(txClient.calls[appId] === call)
+        XCTAssertEqual(call.callInfo?.callerNumber, "+447700900123")
+        XCTAssertNil(call.peer)
+        XCTAssertEqual(socket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+    }
+
+    func testPassiveDiscoveryTimeoutDoesNotCreateMediaOrAnswerAction() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        txClient.inviteTimeoutInterval = 0.01
+        let appId = UUID()
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        socket.emitConnected()
+        txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED"))
+        let settled = expectation(description: "Passive discovery deadline settles")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { settled.fulfill() }
+        wait(for: [settled], timeout: 1)
+        XCTAssertEqual(mockDelegate.doneCallIds, [appId])
+        XCTAssertEqual(mockDelegate.remoteEndedCallIds, [appId])
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+        XCTAssertTrue(mockDelegate.activeCallIds.isEmpty)
+        XCTAssertNil(txClient.calls[appId]?.peer)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+    }
+
+    func testPassiveInviteExposesExactProviderIdentityWithoutMedia() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let appId = UUID()
+        let signalingId = UUID()
+        let sessionId = UUID()
+        let legId = UUID()
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        socket.emitConnected()
+        txClient.onMessageReceived(message: try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: signalingId,
+            sessionId: sessionId, legId: legId
+        ))
+        let call = try XCTUnwrap(mockDelegate.pushCalls.first)
+        XCTAssertEqual(mockDelegate.pushCalls.count, 1)
+        XCTAssertEqual(call.callInfo?.callId, appId)
+        XCTAssertEqual(call.signalingCallId, signalingId)
+        XCTAssertEqual(call.telnyxSessionId, sessionId)
+        XCTAssertEqual(call.telnyxLegId, legId)
+        XCTAssertEqual(call.inviteCustomHeaders?["X-UOS-Pstn-Recipient"], "signed-recipient-reference")
+        XCTAssertNil(call.peer)
+        XCTAssertNil(call.localStream)
+        XCTAssertTrue(mockDelegate.activeCallIds.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+    }
+
+    func testPassiveAttachExposesIdentityWithoutReattachingMediaOrTimingOut() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        txClient.inviteTimeoutInterval = 0.01
+        let appId = UUID()
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        socket.emitConnected()
+        txClient.onMessageReceived(message: gatewayStateMessage(state: "REGED"))
+        txClient.onMessageReceived(message: try incomingIdentityMessage(
+            method: "telnyx_rtc.attach", callId: UUID(), sessionId: UUID(), legId: UUID()
+        ))
+        let call = try XCTUnwrap(mockDelegate.pushCalls.first)
+        XCTAssertEqual(call.callInfo?.callId, appId)
+        XCTAssertEqual(call.direction, .ATTACH)
+        XCTAssertNil(call.peer)
+        XCTAssertNil(call.localStream)
+        XCTAssertTrue(mockDelegate.activeCallIds.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+        let settled = expectation(description: "Passive ATTACH cancels its discovery deadline")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { settled.fulfill() }
+        wait(for: [settled], timeout: 1)
+        XCTAssertTrue(mockDelegate.doneCallIds.isEmpty)
+        XCTAssertTrue(mockDelegate.remoteEndedCallIds.isEmpty)
+    }
+
+    func testPassiveInviteAfterDeclineStillExposesIdentityWithoutMedia() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let appId = UUID()
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        socket.emitConnected()
+        txClient.endCallFromCallkit(endAction: CXEndCallAction(call: appId))
+        txClient.onMessageReceived(message: try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
+        ))
+        let call = try XCTUnwrap(mockDelegate.pushCalls.first)
+        XCTAssertEqual(call.callInfo?.callId, appId)
+        XCTAssertEqual(call.inviteCustomHeaders?["X-UOS-Pstn-Recipient"], "signed-recipient-reference")
+        XCTAssertNil(call.peer)
+        XCTAssertNil(call.localStream)
+        XCTAssertTrue(mockDelegate.activeCallIds.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+    }
+
+    func testPassiveDiscoveryRejectsReplacementOfAnAnsweredCall() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let activeId = UUID()
+        let active = installActiveCall(appCallId: activeId, signalingCallId: UUID(), socket: socket)
+        XCTAssertThrowsError(try startPushFlow(callId: UUID(), authenticateForInvite: true))
+        XCTAssertTrue(txClient.calls[activeId] === active)
+        XCTAssertEqual(active.callState, .ACTIVE)
+    }
+
+    func testPassivePushSocketReplacementIgnoresOldSocketAndAuthenticatesNewSocket() throws {
+        let oldSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let newSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var sockets = [oldSocket, newSocket]
+        txClient.socketFactory = { sockets.removeFirst() }
+        let appId = UUID()
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        oldSocket.emitConnected()
+        oldSocket.isConnected = false
+        try startPushFlow(callId: appId, authenticateForInvite: true)
+        let oldMessageCount = oldSocket.sentMessages.count
+        oldSocket.emitConnected()
+        XCTAssertEqual(oldSocket.sentMessages.count, oldMessageCount)
+        XCTAssertTrue(newSocket.sentMessages.isEmpty)
+        newSocket.emitConnected()
+        XCTAssertEqual(newSocket.sentMessages.filter { $0.contains("telnyx_rtc.login") }.count, 1)
+        txClient.onMessageReceived(socket: oldSocket, message: try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
+        ))
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+        txClient.onMessageReceived(socket: newSocket, message: try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
+        ))
+        XCTAssertEqual(mockDelegate.pushCalls.count, 1)
+        XCTAssertNil(mockDelegate.pushCalls.first?.peer)
+    }
+
     func testAnsweredPushInviteTimeoutUsesPushUUIDAndCompletesAnswerAction() throws {
         let callUUID = UUID()
         txClient.inviteTimeoutInterval = 0.01
@@ -808,8 +975,10 @@ class TxClientPingAuthTests: XCTestCase {
         )
     }
 
-    private func startPushFlow(callId: UUID) throws {
-        let txConfig = TxConfig(sipUser: "test_user", password: "test_password")
+    private func startPushFlow(callId: UUID, authenticateForInvite: Bool = false) throws {
+        let txConfig = TxConfig(
+            sipUser: "test_user", password: "test_password", enableCallReports: false
+        )
         let serverConfig = TxServerConfiguration()
         let pushMetaData: [String: Any] = [
             "voice_sdk_id": "test-sdk-id",
@@ -819,8 +988,27 @@ class TxClientPingAuthTests: XCTestCase {
         try txClient.processVoIPNotification(
             txConfig: txConfig,
             serverConfiguration: serverConfig,
-            pushMetaData: pushMetaData
+            pushMetaData: pushMetaData,
+            authenticateForInvite: authenticateForInvite
         )
+    }
+
+    private func incomingIdentityMessage(
+        method: String, callId: UUID, sessionId: UUID, legId: UUID
+    ) throws -> String {
+        let message: [String: Any] = [
+            "jsonrpc": "2.0", "method": method,
+            "params": [
+                "callID": callId.uuidString,
+                "sdp": "v=0\r\n",
+                "caller_id_name": "Incoming caller", "caller_id_number": "+447700900123",
+                "telnyx_session_id": sessionId.uuidString, "telnyx_leg_id": legId.uuidString,
+                "dialogParams": ["custom_headers": [[
+                    "name": "X-UOS-Pstn-Recipient", "value": "signed-recipient-reference",
+                ]]],
+            ],
+        ]
+        return String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)
     }
 
     private func clientReadyMessage() -> String {
@@ -1037,6 +1225,8 @@ class PingTestDelegate: TxClientDelegate {
     }
 
     var onClientErrorCalled = false
+    var pushCalls: [Call] = []
+    var activeCallIds: [UUID] = []
     var doneCallIds: [UUID] = []
     var remoteEndedCallIds: [UUID] = []
     var pushDeclineResults: [PushDeclineResult] = []
@@ -1049,6 +1239,7 @@ class PingTestDelegate: TxClientDelegate {
     func onSessionUpdated(sessionId: String) {}
     func onIncomingCall(call: Call) {}
     func onCallStateUpdated(callState: CallState, callId: UUID) {
+        if case .ACTIVE = callState { activeCallIds.append(callId) }
         if case .DONE = callState {
             doneCallIds.append(callId)
         }
@@ -1061,7 +1252,7 @@ class PingTestDelegate: TxClientDelegate {
         pushDisabledResults.append(PushDisabledResult(success: success, message: message))
         onPushDisabledHandler?(success, message)
     }
-    func onPushCall(call: Call) {}
+    func onPushCall(call: Call) { pushCalls.append(call) }
     func onPushDeclineCompleted(callId: UUID, success: Bool, error: String?) {
         pushDeclineResults.append(
             PushDeclineResult(callId: callId, success: success, error: error)

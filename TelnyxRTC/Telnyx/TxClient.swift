@@ -171,6 +171,8 @@ public class TxClient {
     /// can deliver an answer before WebSocket reports connected; in that case
     /// answer on this socket instead of replacing it with a second one.
     private var pushSocketConnectionPending = false
+    private var passivePushInviteCallId: UUID?
+    private weak var pushInviteLoginSocket: Socket?
 
     private var answerCallAction: CXAnswerCallAction? = nil
     private var endCallAction: CXEndCallAction? = nil
@@ -1400,13 +1402,7 @@ public class TxClient {
             // Start the login process by sending a login message with decline_push: false
             // Automatically accept the call once the INVITE is received
             if isConnected() {
-                if pushCallState == .loginSent {
-                    Logger.log.i(message: "TxClient:: answerFromCallkit - Push login already sent, waiting for INVITE")
-                } else {
-                    Logger.log.i(message: "TxClient:: answerFromCallkit - Socket connected, performing login with decline_push: false")
-                    performLogin(declinePush: false)
-                    pushCallState = .loginSent
-                }
+                authenticatePushForInviteIfNeeded()
             } else {
                 Logger.log.i(message: "TxClient:: answerFromCallkit - Socket not connected, connecting first")
                 if pushSocketConnectionPending, socket != nil {
@@ -1441,7 +1437,19 @@ public class TxClient {
         }
     }
     
+    private func authenticatePushForInviteIfNeeded() {
+        guard isCallFromPush, !pendingCallDecline,
+              pushCallState != .inviteReceived,
+              let currentSocket = socket else { return }
+        guard pushCallState != .loginSent || pushInviteLoginSocket !== currentSocket else { return }
+        pushCallState = .loginSent
+        pushInviteLoginSocket = currentSocket
+        performLogin(declinePush: false)
+    }
+
     private func resetPushVariables() {
+        passivePushInviteCallId = nil
+        pushInviteLoginSocket = nil
         pendingAnswerHeaders = [:]
         pendingAnswerPreferredCodecs = nil
         answerCallAction = nil
@@ -2045,7 +2053,8 @@ public class TxClient {
                     self.sendAttachCall()
                     
                     // Start INVITE timeout for VoIP push calls that are being answered (not declined)
-                    if answerCallAction != nil && !pendingCallDecline && pushCallState != .inviteReceived {
+                    if (answerCallAction != nil || passivePushInviteCallId == currentCallId) &&
+                        !pendingCallDecline && pushCallState != .inviteReceived {
                         Logger.log.i(message: "TxClient:: updateGatewayState() Starting INVITE timeout for VoIP push call")
                         startInviteTimeout()
                     }
@@ -2320,6 +2329,7 @@ extension TxClient {
             signalingCallId = callId
         }
 
+        let passiveInvite = passivePushInviteCallId == appFacingCallId
         let reattachedPreferredCodecs = isAttach
             ? self.calls[appFacingCallId]?.preferredAudioCodecs
             : nil
@@ -2338,8 +2348,8 @@ extension TxClient {
                         delegate: self,
                         telnyxSessionId: UUID(uuidString: telnyxSessionId),
                         telnyxLegId: UUID(uuidString: telnyxLegId),
-                        ringtone: self.txConfig?.ringtone,
-                        ringbackTone: self.txConfig?.ringBackTone,
+                        ringtone: passiveInvite ? nil : self.txConfig?.ringtone,
+                        ringbackTone: passiveInvite ? nil : self.txConfig?.ringBackTone,
                         iceServers: self.serverConfiguration.webRTCIceServers,
                         isAttach: isAttach,
                         debug: self.txConfig?.debug ?? false,
@@ -2364,7 +2374,7 @@ extension TxClient {
 
         currentCallId = appFacingCallId
         
-        if isAttach {
+        if isAttach && !passiveInvite {
             Logger.log.i(message: "TxClient :: Attaching Call....")
             call.acceptReAttach(
                 peer: nil,
@@ -2379,6 +2389,7 @@ extension TxClient {
             // onPushCall or answering first can resurrect a call which
             // CallKit has already removed.
             if pendingCallDecline || endCallAction != nil {
+                if passiveInvite { self.delegate?.onPushCall(call: call) }
                 if let answerCallAction, !answerCallAction.isComplete {
                     answerCallAction.fail()
                 }
@@ -2421,7 +2432,9 @@ extension TxClient {
     ///                    (this should be gotten from payload.dictionaryPayload["metadata"] as? [String: Any])
     /// - Throws: Error during the connection process
     public func processVoIPNotification(txConfig: TxConfig,
-                                        serverConfiguration: TxServerConfiguration,pushMetaData:[String: Any]) throws {
+                                        serverConfiguration: TxServerConfiguration,
+                                        pushMetaData: [String: Any],
+                                        authenticateForInvite: Bool = false) throws {
         
         
         let rtc_id = (pushMetaData["voice_sdk_id"] as? String)
@@ -2434,10 +2447,24 @@ extension TxClient {
             throw TxError.clientConfigurationFailed(reason: .voiceSdkIsRequired)
         }
         
+        let requestedCallId = (pushMetaData["call_id"] as? String).flatMap(UUID.init(uuidString:))
+        let noActiveCalls = self.calls.filter {
+            $0.value.callState.isConsideredActive
+        }.isEmpty
+        if authenticateForInvite {
+            guard requestedCallId != nil, noActiveCalls else {
+                throw TxError.callFailed(reason: .callNotFound)
+            }
+        }
+        if noActiveCalls && isConnected() {
+            Logger.log.i(message: "TxClient:: processVoIPNotification - No Active Calls disconnect")
+            self.disconnect()
+        }
+
         self.pushMetaData = pushMetaData
         self.pushCallState = .idle
+        self.pushInviteLoginSocket = nil
         
-        // Store config objects for later use (don't login immediately)
         self.storedTxConfig = txConfig
         self.storedServerConfiguration = TxServerConfiguration(
             signalingServer:nil,
@@ -2446,26 +2473,22 @@ extension TxClient {
             pushMetaData: pushMetaData,
             region: serverConfiguration.region)
                 
-        let noActiveCalls = self.calls.filter { 
-            $0.value.callState.isConsideredActive
-        }.isEmpty
-
-        if noActiveCalls && isConnected() {
-            Logger.log.i(message: "TxClient:: processVoIPNotification - No Active Calls disconnect")
-            self.disconnect()
-        }
-        
+        self.passivePushInviteCallId = authenticateForInvite ? requestedCallId : nil
+        self.isCallFromPush = true
+        if let requestedCallId { self.currentCallId = requestedCallId }
         if noActiveCalls {
             do {
-                Logger.log.i(message: "TxClient:: No Active Calls - Only connecting socket, not logging in")
-                // Only initiate socket connection, don't login yet
+                Logger.log.i(message: "TxClient:: Connecting push signaling socket")
                 try self.connectSocketOnly(serverConfiguration: self.storedServerConfiguration!)
                 
                 // Create an initial call_object to handle early bye message
                 if let newCallId = pushMetaData["call_id"] as? String,
                    let callUUID = UUID(uuidString: newCallId),
                    let socket = self.socket,
-                   let iceServers = self.storedServerConfiguration?.webRTCIceServers {
+                   let iceServers = self.storedServerConfiguration?.webRTCIceServers,
+                   self.calls[callUUID]?.callInfo?.callerNumber == nil,
+                   self.calls[callUUID]?.callInfo?.callerName == nil,
+                   self.currentCallId == callUUID {
                     self.calls[callUUID] = Call(callId: callUUID,
                                                remoteSdp: "",
                                                sessionId: newCallId,
@@ -2492,9 +2515,6 @@ extension TxClient {
                 Logger.log.e(message: "TxClient:: push flow connect error \(error.localizedDescription)")
             }
         }
-       
-    
-        self.isCallFromPush = true
     }
 
     /// To receive INVITE message after Push Noficiation is Received. Send attachCall Command
@@ -2710,14 +2730,8 @@ extension TxClient : SocketDelegate {
                 Logger.log.i(message: "TxClient:: Socket connected for decline_push flow")
                 performLogin(declinePush: true)
                 return
-            } else if answerCallAction != nil {
-                if pushCallState == .loginSent {
-                    Logger.log.i(message: "TxClient:: Socket connected for answer flow - push login already sent")
-                } else {
-                    Logger.log.i(message: "TxClient:: Socket connected for answer flow")
-                    performLogin(declinePush: false)
-                    pushCallState = .loginSent
-                }
+            } else if answerCallAction != nil || passivePushInviteCallId == currentCallId {
+                authenticatePushForInviteIfNeeded()
                 return
             } else {
                 Logger.log.i(message: "TxClient:: Socket connected from push - waiting for CallKit answer or end")
@@ -3157,6 +3171,10 @@ extension TxClient : SocketDelegate {
                         return
                     }
                     
+                    if passivePushInviteCallId == currentCallId {
+                        pushCallState = .inviteReceived
+                        stopInviteTimeout()
+                    }
                     self.voiceSdkId = vertoMessage.voiceSdkId
 
                     let callerName = params["caller_id_name"] as? String ?? ""
