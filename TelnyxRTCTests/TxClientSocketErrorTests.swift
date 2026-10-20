@@ -347,6 +347,24 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertNil(mockDelegate.pushCalls.first?.peer)
     }
 
+    func testPassiveDiscoveryPreservesHeldAndRecoveringCalls() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var socketCount = 0
+        txClient.socketFactory = { socketCount += 1; return socket }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let callId = UUID()
+        let call = installActiveCall(appCallId: callId, signalingCallId: UUID(), socket: socket)
+        let states: [CallState] = [.HELD, .RECONNECTING(reason: .networkSwitch), .DROPPED(reason: .networkLost)]
+        for state in states {
+            call.updateCallState(callState: state)
+            XCTAssertThrowsError(try startPushFlow(callId: UUID(), authenticateForInvite: true))
+            XCTAssertTrue(txClient.calls[callId] === call)
+            XCTAssertEqual(txClient.calls.count, 1)
+            XCTAssertEqual(call.callState, state)
+            XCTAssertEqual(socketCount, 1)
+        }
+    }
+
     func testAnsweredPushInviteTimeoutUsesPushUUIDAndCompletesAnswerAction() throws {
         let callUUID = UUID()
         txClient.inviteTimeoutInterval = 0.01

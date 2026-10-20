@@ -2452,7 +2452,15 @@ extension TxClient {
             $0.value.callState.isConsideredActive
         }.isEmpty
         if authenticateForInvite {
-            guard requestedCallId != nil, noActiveCalls else {
+            let hasRecoveringCall = self.calls.values.contains { call in
+                switch call.callState {
+                case .RECONNECTING, .DROPPED:
+                    return true
+                default:
+                    return false
+                }
+            }
+            guard requestedCallId != nil, noActiveCalls, !hasRecoveringCall else {
                 throw TxError.callFailed(reason: .callNotFound)
             }
         }
