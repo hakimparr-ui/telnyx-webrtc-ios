@@ -172,6 +172,7 @@ public class TxClient {
     /// answer on this socket instead of replacing it with a second one.
     private var pushSocketConnectionPending = false
     private var passivePushInviteCallId: UUID?
+    private var pendingPushInviteAuthentication: (callId: UUID, call: Call, socket: Socket)?
     private weak var pushInviteLoginSocket: Socket?
 
     private var answerCallAction: CXAnswerCallAction? = nil
@@ -1442,6 +1443,42 @@ public class TxClient {
         }
     }
     
+    public func authenticatePendingPushForInvite(callId: UUID) throws {
+        guard isCallFromPush, currentCallId == callId,
+              let metadataId = pushMetaData?["call_id"] as? String,
+              UUID(uuidString: metadataId) == callId,
+              !pendingCallDecline, endCallAction == nil, answerCallAction == nil,
+              pushCallState != .inviteReceived,
+              let currentSocket = socket,
+              let currentCall = calls[callId],
+              currentCall.callInfo?.callId == callId,
+              currentCall.socket === currentSocket,
+              currentCall.callState == .NEW,
+              currentCall.peer == nil, currentCall.localStream == nil,
+              currentCall.remoteSdp?.isEmpty == true,
+              sessionId != nil,
+              let storedConfig = storedTxConfig,
+              storedConfig.token != nil || (storedConfig.sipUser != nil && storedConfig.password != nil),
+              currentSocket.isConnected || pushSocketConnectionPending,
+              !calls.values.contains(where: { call in
+                  switch call.callState {
+                  case .ACTIVE, .HELD, .CONNECTING, .RECONNECTING, .DROPPED:
+                      return true
+                  default:
+                      return false
+                  }
+              }) else {
+            throw TxError.callFailed(reason: .callNotFound)
+        }
+        passivePushInviteCallId = callId
+        if currentSocket.isConnected {
+            pendingPushInviteAuthentication = nil
+            authenticatePushForInviteIfNeeded()
+        } else {
+            pendingPushInviteAuthentication = (callId, currentCall, currentSocket)
+        }
+    }
+
     private func authenticatePushForInviteIfNeeded() {
         guard isCallFromPush, !pendingCallDecline,
               pushCallState != .inviteReceived,
@@ -1453,6 +1490,7 @@ public class TxClient {
     }
 
     private func resetPushVariables() {
+        pendingPushInviteAuthentication = nil
         passivePushInviteCallId = nil
         pushInviteLoginSocket = nil
         pendingAnswerHeaders = [:]
@@ -2487,6 +2525,7 @@ extension TxClient {
             pushMetaData: pushMetaData,
             region: serverConfiguration.region)
                 
+        self.pendingPushInviteAuthentication = nil
         self.passivePushInviteCallId = authenticateForInvite ? requestedCallId : nil
         self.isCallFromPush = true
         if let requestedCallId { self.currentCallId = requestedCallId }
@@ -2745,7 +2784,18 @@ extension TxClient : SocketDelegate {
                 Logger.log.i(message: "TxClient:: Socket connected for decline_push flow")
                 performLogin(declinePush: true)
                 return
-            } else if answerCallAction != nil || passivePushInviteCallId == currentCallId {
+            } else if answerCallAction != nil {
+                pendingPushInviteAuthentication = nil
+                authenticatePushForInviteIfNeeded()
+                return
+            } else if let pending = pendingPushInviteAuthentication {
+                pendingPushInviteAuthentication = nil
+                if passivePushInviteCallId == pending.callId { passivePushInviteCallId = nil }
+                guard pending.socket === sourceSocket,
+                      calls[pending.callId] === pending.call else { return }
+                try? authenticatePendingPushForInvite(callId: pending.callId)
+                return
+            } else if passivePushInviteCallId == currentCallId {
                 authenticatePushForInviteIfNeeded()
                 return
             } else {

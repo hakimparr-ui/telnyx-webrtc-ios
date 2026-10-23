@@ -193,6 +193,204 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(answerAction.failCallCount, 0)
     }
 
+    func testPendingPushAuthenticationUsesConnectedSocketOnceWithoutAnswer() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var socketCount = 0
+        txClient.socketFactory = { socketCount += 1; return socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        let placeholder = try XCTUnwrap(txClient.calls[callId])
+        socket.emitConnected()
+        XCTAssertTrue(loginMessages(socket).isEmpty)
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        XCTAssertEqual(socketCount, 1)
+        XCTAssertTrue(txClient.calls[callId] === placeholder)
+        XCTAssertEqual(loginMessages(socket).count, 1)
+        let params = try XCTUnwrap(loginMessages(socket).first?["params"] as? [String: Any])
+        XCTAssertEqual(params["from_push"] as? Bool, true)
+        let loginParams = try XCTUnwrap(params["loginParams"] as? [String: Any])
+        XCTAssertEqual(loginParams["attach_call"] as? String, "true")
+        XCTAssertNil(loginParams["decline_push"])
+        XCTAssertNil(placeholder.peer)
+        XCTAssertNil(placeholder.localStream)
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+    }
+
+    func testPendingPushAuthenticationWaitsForExactConnectingSocket() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var socketCount = 0
+        txClient.socketFactory = { socketCount += 1; return socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+        socket.emitConnected()
+        socket.emitConnected()
+        XCTAssertEqual(socketCount, 1)
+        XCTAssertEqual(loginMessages(socket).count, 1)
+        XCTAssertNil(txClient.calls[callId]?.peer)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+    }
+
+    func testPendingPushAuthenticationExposesInviteIdentityWithoutMedia() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        let signalingId = UUID()
+        let sessionId = UUID()
+        let legId = UUID()
+        try startPushFlow(callId: callId)
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        socket.emitConnected()
+        socket.emitMessage(try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: signalingId, sessionId: sessionId, legId: legId
+        ))
+        let call = try XCTUnwrap(mockDelegate.pushCalls.first)
+        XCTAssertEqual(mockDelegate.pushCalls.count, 1)
+        XCTAssertEqual(call.callInfo?.callId, callId)
+        XCTAssertEqual(call.signalingCallId, signalingId)
+        XCTAssertEqual(call.telnyxSessionId, sessionId)
+        XCTAssertEqual(call.telnyxLegId, legId)
+        XCTAssertEqual(call.inviteCustomHeaders?["X-UOS-Pstn-Recipient"], "signed-recipient-reference")
+        XCTAssertNil(call.peer)
+        XCTAssertNil(call.localStream)
+        XCTAssertTrue(mockDelegate.activeCallIds.isEmpty)
+        XCTAssertFalse(socket.sentMessages.contains { $0.contains("telnyx_rtc.answer") })
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+    }
+
+    func testPendingPushAuthenticationRejectsWrongOrMissingCallWithoutMutation() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        let placeholder = try XCTUnwrap(txClient.calls[callId])
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: UUID()))
+        XCTAssertTrue(txClient.calls[callId] === placeholder)
+        txClient.calls.removeValue(forKey: callId)
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+        socket.emitConnected()
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+    }
+
+    func testPendingPushAuthenticationRejectsMismatchedPlaceholderSocket() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let otherSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        txClient.calls[callId]?.socket = otherSocket
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+        socket.emitConnected()
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+        XCTAssertTrue(otherSocket.sentMessages.isEmpty)
+    }
+
+    func testPendingPushAuthenticationRejectsPendingAnswerWithoutChangingIt() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        let answer = TrackingAnswerCallAction(call: callId)
+        txClient.answerFromCallkit(answerAction: answer)
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+        XCTAssertEqual(answer.fulfillCallCount, 0)
+        XCTAssertEqual(answer.failCallCount, 0)
+        socket.emitConnected()
+        XCTAssertEqual(loginMessages(socket).count, 1)
+    }
+
+    func testPendingPushAuthenticationRejectsPendingDecline() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        txClient.endCallFromCallkit(endAction: CXEndCallAction(call: callId))
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+        XCTAssertTrue(socket.sentMessages.isEmpty)
+    }
+
+    func testPendingPushAuthenticationPreservesActiveHeldAndRecoveringCalls() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        let otherId = UUID()
+        let other = installActiveCall(appCallId: otherId, signalingCallId: UUID(), socket: socket)
+        let states: [CallState] = [.ACTIVE, .HELD, .CONNECTING, .RECONNECTING(reason: .networkSwitch), .DROPPED(reason: .networkLost)]
+        for state in states {
+            other.updateCallState(callState: state)
+            XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+            XCTAssertTrue(txClient.calls[otherId] === other)
+            XCTAssertEqual(other.callState, state)
+        }
+        socket.emitConnected()
+        XCTAssertTrue(loginMessages(socket).isEmpty)
+    }
+
+    func testPendingPushAuthenticationIgnoresLateRemovedPlaceholderConnection() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        txClient.calls.removeValue(forKey: callId)
+        socket.emitConnected()
+        socket.emitConnected()
+        XCTAssertTrue(loginMessages(socket).isEmpty)
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+    }
+
+    func testPendingPushAuthenticationRechecksLateActiveOwner() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        txClient.socketFactory = { socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        let call = try XCTUnwrap(txClient.calls[callId])
+        try txClient.authenticatePendingPushForInvite(callId: callId)
+        call.updateCallState(callState: .ACTIVE)
+        socket.emitConnected()
+        socket.emitConnected()
+        XCTAssertTrue(loginMessages(socket).isEmpty)
+        XCTAssertTrue(txClient.calls[callId] === call)
+        XCTAssertEqual(call.callState, .ACTIVE)
+    }
+
+    func testPendingPushAuthenticationCannotFollowReplacementPushOwner() throws {
+        let oldSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        let newSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var sockets = [oldSocket, newSocket]
+        txClient.socketFactory = { sockets.removeFirst() }
+        let oldId = UUID()
+        let newId = UUID()
+        try startPushFlow(callId: oldId)
+        try txClient.authenticatePendingPushForInvite(callId: oldId)
+        try startPushFlow(callId: newId)
+        oldSocket.emitConnected()
+        newSocket.emitConnected()
+        XCTAssertTrue(oldSocket.sentMessages.isEmpty)
+        XCTAssertTrue(newSocket.sentMessages.isEmpty)
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: oldId))
+        try txClient.authenticatePendingPushForInvite(callId: newId)
+        XCTAssertEqual(loginMessages(newSocket).count, 1)
+        XCTAssertTrue(mockDelegate.pushCalls.isEmpty)
+    }
+
+    func testPendingPushAuthenticationRejectsClosedSocketWithoutReconnect() throws {
+        let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var socketCount = 0
+        txClient.socketFactory = { socketCount += 1; return socket }
+        let callId = UUID()
+        try startPushFlow(callId: callId)
+        socket.emitConnected()
+        socket.emitDisconnected(reconnect: false)
+        XCTAssertThrowsError(try txClient.authenticatePendingPushForInvite(callId: callId))
+        XCTAssertEqual(socketCount, 1)
+        XCTAssertTrue(loginMessages(socket).isEmpty)
+    }
+
     func testPassivePushAuthenticatesBeforeAnswerOnTheExistingSocket() throws {
         let socket = ActiveTerminationTestSocket(connectsSuccessfully: false)
         var socketCount = 0
