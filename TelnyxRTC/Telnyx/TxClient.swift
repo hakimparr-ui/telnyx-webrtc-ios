@@ -239,6 +239,7 @@ public class TxClient {
     internal var activeCallTerminationGatewayPollInterval: TimeInterval = TxClient.DEFAULT_REGISTER_INTERVAL
     internal var activeCallTerminationMaxReconnectAttempts: Int = 3
     internal var socketFactory: () -> Socket = { Socket() }
+    private var socketReconnectGeneration: UInt = 0
     
     // Timeout mechanism for VoIP push calls
     private var inviteTimeoutTimer: Timer?
@@ -644,6 +645,7 @@ public class TxClient {
             self.serverConfiguration = serverConfiguration
         }
         failPendingDisablePushForSocketReplacement()
+        socketReconnectGeneration &+= 1
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -669,6 +671,7 @@ public class TxClient {
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
         failPendingDisablePushForSocketReplacement()
+        socketReconnectGeneration &+= 1
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -688,6 +691,7 @@ public class TxClient {
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
         failPendingDisablePushForSocketReplacement()
+        socketReconnectGeneration &+= 1
         self.socket = socketFactory()
         self.socket?.delegate = self
         self.pushSocketConnectionPending = true
@@ -768,6 +772,7 @@ public class TxClient {
 
     /// Disconnects the TxClient from the Telnyx signaling server.
     public func disconnect() {
+        socketReconnectGeneration &+= 1
         Logger.log.i(message: "TxClient:: disconnect()")
         _ = finishPendingDisablePush(
             socket: socket,
@@ -1925,6 +1930,7 @@ public class TxClient {
             self.gatewayState = .NOREG
             self.gatewayRegisteredSocket = nil
             self.failPendingDisablePushForSocketReplacement()
+            socketReconnectGeneration &+= 1
             self.socket = socketFactory()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
@@ -2725,6 +2731,7 @@ extension TxClient : SocketDelegate {
             Logger.log.i(message: "TxClient:: ignoring connected callback from obsolete socket")
             return
         }
+        socketReconnectGeneration &+= 1
         clearObsoleteActiveCallTerminationByeTransactions(currentSocket: sourceSocket)
         pushSocketConnectionPending = false
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected()")
@@ -2846,7 +2853,12 @@ extension TxClient : SocketDelegate {
             } else {
                 declineReconnectGeneration = nil
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + TxClient.RECONNECT_BUFFER) {
+            socketReconnectGeneration &+= 1
+            let reconnectGeneration = socketReconnectGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + TxClient.RECONNECT_BUFFER) { [weak self] in
+                guard let self,
+                      self.socketReconnectGeneration == reconnectGeneration,
+                      self.socket == nil || sourceSocket === self.socket else { return }
                 if let declineReconnectGeneration {
                     guard self.pendingCallDecline,
                           self.pendingDeclineReconnectGeneration == declineReconnectGeneration else {

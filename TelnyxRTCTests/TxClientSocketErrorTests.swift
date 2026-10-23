@@ -338,6 +338,157 @@ class TxClientPingAuthTests: XCTestCase {
         XCTAssertEqual(active.callState, .ACTIVE)
     }
 
+    func testDelayedReconnectDoesNotRestartExplicitlyDisconnectedClient() throws {
+        let oldSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = createdSockets.isEmpty ? oldSocket : ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        oldSocket.emitDisconnected()
+        txClient.disconnect()
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 1)
+        XCTAssertFalse(txClient.isConnected())
+    }
+
+    func testDelayedReconnectCannotReplaceNewerConnection() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        let config = TxConfig(sipUser: "test_user", password: "test_password")
+        try txClient.connect(txConfig: config)
+        createdSockets[0].emitDisconnected()
+        try txClient.connect(txConfig: config)
+        let current = createdSockets[1]
+        current.emitConnected()
+        let loginCount = loginMessages(current).count
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+        XCTAssertEqual(loginMessages(current).count, loginCount)
+        XCTAssertTrue(txClient.isConnected())
+    }
+
+    func testDelayedReconnectCannotReplaceNewerPassivePushSocket() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        createdSockets[0].emitDisconnected()
+        let pushId = UUID()
+        try startPushFlow(callId: pushId, authenticateForInvite: true)
+        let pushSocket = createdSockets[1]
+        pushSocket.emitConnected()
+        XCTAssertEqual(loginMessages(pushSocket).count, 1)
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+        txClient.onMessageReceived(socket: pushSocket, message: try incomingIdentityMessage(
+            method: "telnyx_rtc.invite", callId: UUID(), sessionId: UUID(), legId: UUID()
+        ))
+        XCTAssertEqual(mockDelegate.pushCalls.count, 1)
+        XCTAssertEqual(mockDelegate.pushCalls.first?.callInfo?.callId, pushId)
+        XCTAssertNil(mockDelegate.pushCalls.first?.peer)
+    }
+
+    func testDuplicateDelayedReconnectCreatesOnlyOneReplacement() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let oldSocket = createdSockets[0]
+        oldSocket.emitDisconnected()
+        oldSocket.emitDisconnected()
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+    }
+
+    func testCurrentSocketStillRecoversAfterDelayedReconnect() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        createdSockets[0].emitDisconnected()
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+        createdSockets[1].emitConnected()
+        XCTAssertTrue(txClient.isConnected())
+        XCTAssertEqual(loginMessages(createdSockets[1]).count, 1)
+    }
+
+    func testRegionalFallbackSurvivesTrailingDisconnectedCallback() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let oldSocket = createdSockets[0]
+        txClient.onSocketDisconnected(socket: oldSocket, reconnect: true, region: .auto)
+        oldSocket.emitDisconnected(reconnect: false)
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+        guard createdSockets.count == 2 else { return }
+        createdSockets[1].emitConnected()
+        XCTAssertTrue(txClient.isConnected())
+        XCTAssertEqual(loginMessages(createdSockets[1]).count, 1)
+    }
+
+    func testDelayedReconnectCannotRestartAfterReplacementSocketCloses() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        let config = TxConfig(sipUser: "test_user", password: "test_password")
+        try txClient.connect(txConfig: config)
+        createdSockets[0].emitDisconnected()
+        try txClient.connect(txConfig: config)
+        createdSockets[1].emitDisconnected(reconnect: false)
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 2)
+        XCTAssertFalse(txClient.isConnected())
+    }
+
+    func testDelayedReconnectDoesNotReplaceRecoveredCurrentSocket() throws {
+        var createdSockets: [ActiveTerminationTestSocket] = []
+        txClient.socketFactory = {
+            let next = ActiveTerminationTestSocket(connectsSuccessfully: false)
+            createdSockets.append(next)
+            return next
+        }
+        try txClient.connect(txConfig: TxConfig(sipUser: "test_user", password: "test_password"))
+        let current = createdSockets[0]
+        current.emitDisconnected()
+        current.emitConnected()
+        XCTAssertTrue(txClient.isConnected())
+        waitForDelayedSocketReconnect()
+        XCTAssertEqual(createdSockets.count, 1)
+        XCTAssertTrue(txClient.isConnected())
+        XCTAssertEqual(loginMessages(current).count, 1)
+    }
+
+    private func waitForDelayedSocketReconnect() {
+        let drained = expectation(description: "SDK reconnect deadline drained")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+    }
+
     func testPassivePushSocketReplacementIgnoresOldSocketAndAuthenticatesNewSocket() throws {
         let oldSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
         let newSocket = ActiveTerminationTestSocket(connectsSuccessfully: false)
