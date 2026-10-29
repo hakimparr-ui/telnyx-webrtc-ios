@@ -224,6 +224,7 @@ public class Call {
     private let terminationLock = NSRecursiveLock()
     private var terminationStarted = false
     private var localDeclineMediaStopped = false
+    private var wasCreatedAsPassivePushInvite = false
     private var answerStarted = false
     private var hasEnteredMediaState = false
 
@@ -822,12 +823,21 @@ public class Call {
         self.peer?.dispose()
     }
 
+    internal func recordPassivePushInvite() {
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        guard !terminationStarted, !answerStarted, !hasEnteredMediaState,
+              peer == nil, let remoteSdp, !remoteSdp.isEmpty,
+              callState == .NEW || callState == .RINGING else { return }
+        wasCreatedAsPassivePushInvite = true
+    }
+
     internal func stopLocalMediaForUnansweredDecline() -> Bool {
         guard Thread.isMainThread else { return false }
         terminationLock.lock()
         defer { terminationLock.unlock() }
         if localDeclineMediaStopped { return peer == nil }
-        guard direction == .INBOUND,
+        guard direction == .INBOUND || (direction == .ATTACH && wasCreatedAsPassivePushInvite),
               callState == .NEW || callState == .RINGING,
               !terminationStarted, !answerStarted, !hasEnteredMediaState,
               peer == nil, let remoteSdp, !remoteSdp.isEmpty else { return false }

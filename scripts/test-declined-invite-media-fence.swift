@@ -64,6 +64,34 @@ for direction in protectedDirections {
     call.direction = direction
     check(!owner.stopLocalMediaForUnansweredDecline(callId: uuid, expectedCall: call), "nonincoming call refused")
 }
+let (passiveAttachOwner, passiveAttach, passiveAttachId) = installedCall()
+passiveAttach.direction = .ATTACH
+passiveAttachOwner.passivePushInviteCallId = passiveAttachId
+passiveAttach.recordPassivePushInvite()
+passiveAttachOwner.passivePushInviteCallId = UUID()
+check(passiveAttachOwner.stopLocalMediaForUnansweredDecline(callId: passiveAttachId, expectedCall: passiveAttach), "exact passive ATTACH can end local presentation without starting media")
+check(passiveAttachOwner.hasStoppedLocalMediaForUnansweredDecline(callId: passiveAttachId, expectedCall: passiveAttach), "passive ATTACH readback is exact")
+passiveAttachOwner.passivePushInviteCallId = UUID()
+passiveAttachOwner.deliverIncoming(callId: passiveAttach.signalingCallId)
+passiveAttach.reattach()
+check(passiveAttachOwner.createdCallCount == 0 && passiveAttach.peer == nil, "passive ATTACH fence survives a replacement passive owner")
+let (wrongPassiveOwner, wrongPassive, wrongPassiveId) = installedCall()
+wrongPassive.direction = .ATTACH
+wrongPassiveOwner.passivePushInviteCallId = UUID()
+check(!wrongPassiveOwner.stopLocalMediaForUnansweredDecline(callId: wrongPassiveId, expectedCall: wrongPassive), "unrelated passive push cannot authorise ATTACH decline")
+let (recoveryOwner, recovery, recoveryId) = installedCall()
+recovery.direction = .ATTACH
+recoveryOwner.passivePushInviteCallId = recoveryId
+recovery.recordPassivePushInvite()
+recovery.reattach()
+check(!recoveryOwner.stopLocalMediaForUnansweredDecline(callId: recoveryId, expectedCall: recovery), "recovering ATTACH with media remains protected despite passive flag")
+check(recovery.peer != nil && !recovery.localDeclineMediaStopped, "recovery media is untouched")
+let (lateStampOwner, lateStamp, lateStampId) = installedCall()
+lateStamp.direction = .ATTACH
+lateStamp.reattach()
+lateStamp.recordPassivePushInvite()
+check(!lateStamp.wasCreatedAsPassivePushInvite, "passive evidence cannot be added after media starts")
+check(!lateStampOwner.stopLocalMediaForUnansweredDecline(callId: lateStampId, expectedCall: lateStamp), "late passive stamp cannot authorise stopping recovery")
 let (ringOwner, ringing, ringId) = installedCall()
 ringing.callState = .RINGING
 check(ringOwner.stopLocalMediaForUnansweredDecline(callId: ringId, expectedCall: ringing), "ringing passive invite accepted")

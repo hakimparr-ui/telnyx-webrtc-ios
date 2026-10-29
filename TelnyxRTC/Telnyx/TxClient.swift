@@ -2439,6 +2439,7 @@ extension TxClient {
                         pushWhenActive: self.txConfig?.pushWhenActive ?? false,
                         pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken,
                         peerFactory: peerFactory)
+        if passiveInvite { call.recordPassivePushInvite() }
         call.callInfo?.callerName = callerName
         call.callInfo?.callerNumber = callerNumber
         call.callOptions = TxCallOptions(audio: true)
