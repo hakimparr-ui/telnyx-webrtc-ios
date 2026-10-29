@@ -223,6 +223,9 @@ public class Call {
     private var answerPreferredCodecs: [TxCodecCapability]?
     private let terminationLock = NSRecursiveLock()
     private var terminationStarted = false
+    private var localDeclineMediaStopped = false
+    private var answerStarted = false
+    private var hasEnteredMediaState = false
 
     private var isTerminating: Bool {
         terminationLock.lock()
@@ -819,6 +822,27 @@ public class Call {
         self.peer?.dispose()
     }
 
+    internal func stopLocalMediaForUnansweredDecline() -> Bool {
+        guard Thread.isMainThread else { return false }
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        if localDeclineMediaStopped { return peer == nil }
+        guard direction == .INBOUND,
+              callState == .NEW || callState == .RINGING,
+              !terminationStarted, !answerStarted, !hasEnteredMediaState,
+              peer == nil, let remoteSdp, !remoteSdp.isEmpty else { return false }
+        localDeclineMediaStopped = true
+        stopRingtone()
+        stopRingbackTone()
+        return true
+    }
+
+    internal var hasStoppedLocalMediaForUnansweredDecline: Bool {
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        return localDeclineMediaStopped && peer == nil && !answerStarted && !hasEnteredMediaState
+    }
+
     internal func updateCallState(callState: CallState) {
         terminationLock.lock()
         if case .DONE = callState {
@@ -827,12 +851,18 @@ public class Call {
                 return
             }
             terminationStarted = true
-        } else if terminationStarted {
+        } else if terminationStarted || localDeclineMediaStopped {
             terminationLock.unlock()
             return
         }
         Logger.log.i(message: "Call state updated: \(callState)")
         self.callState = callState
+        switch callState {
+        case .ACTIVE, .HELD, .CONNECTING, .RECONNECTING, .DROPPED:
+            hasEnteredMediaState = true
+        default:
+            break
+        }
 
         callReportCollector?.addLogEntry(
             level: "info",
@@ -985,7 +1015,13 @@ extension Call {
     ///   - debug: (optional) Enable debug mode for call quality metrics and WebRTC statistics.
     ///     When enabled, real-time call quality metrics will be available through the `onCallQualityChange` callback.
     public func answer(customHeaders:[String:String] = [:], debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
-        guard !isTerminating, callState != .DONE() else { return }
+        terminationLock.lock()
+        guard !terminationStarted, !localDeclineMediaStopped, callState != .DONE() else {
+            terminationLock.unlock()
+            return
+        }
+        answerStarted = true
+        terminationLock.unlock()
         self.answerPreferredCodecs = preferredCodecs
         // Start benchmarking for inbound calls when answer is called
         CallTimingBenchmark.start(isOutbound: false)
@@ -1023,7 +1059,13 @@ extension Call {
     ///         - customHeaders: (optional) Custom Headers to be passed over webRTC Messages, should be in the
     ///     format `X-key:Value` `X` is required for headers to be passed.
     internal func acceptReAttach(peer: Peer?, customHeaders:[String:String] = [:],debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
-        guard !isTerminating, callState != .DONE() else { return }
+        terminationLock.lock()
+        guard !terminationStarted, !localDeclineMediaStopped, callState != .DONE() else {
+            terminationLock.unlock()
+            return
+        }
+        answerStarted = true
+        terminationLock.unlock()
         if let preferredCodecs { answerPreferredCodecs = preferredCodecs }
         //TODO: Create an error if there's no remote SDP
         guard let remoteSdp = self.remoteSdp else {
@@ -1618,6 +1660,9 @@ extension Call {
 extension Call {
 
     private func playRingtone() {
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        guard !terminationStarted, !localDeclineMediaStopped else { return }
         Logger.log.i(message: "Call:: playRingtone()")
         guard let ringtonePlayer = self.ringTonePlayer else { return  }
 
@@ -1631,6 +1676,9 @@ extension Call {
     }
 
     private func playRingbackTone() {
+        terminationLock.lock()
+        defer { terminationLock.unlock() }
+        guard !terminationStarted, !localDeclineMediaStopped else { return }
         Logger.log.i(message: "Call:: playRingbackTone()")
         guard let ringbackPlayer = self.ringbackPlayer else { return  }
 

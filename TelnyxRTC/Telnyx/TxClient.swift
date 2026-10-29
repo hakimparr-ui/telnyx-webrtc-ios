@@ -249,6 +249,7 @@ public class TxClient {
     /// Maps socket callID -> app-facing callID for push-originated calls
     /// where the two UUIDs differ.
     private var socketToAppCallId: [UUID: UUID] = [:]
+    private var locallyDeclinedIncomingCallIds: Set<UUID> = []
     private static let INVITE_TIMEOUT_SECONDS: TimeInterval = 10.0
     internal var inviteTimeoutInterval: TimeInterval = TxClient.INVITE_TIMEOUT_SECONDS
     
@@ -822,6 +823,31 @@ public class TxClient {
     public func isConnected() -> Bool {
         guard let isConnected = socket?.isConnected else { return false }
         return isConnected
+    }
+
+    @discardableResult
+    public func stopLocalMediaForUnansweredDecline(callId: UUID, expectedCall: Call) -> Bool {
+        guard Thread.isMainThread,
+              calls[callId] === expectedCall,
+              expectedCall.callInfo?.callId == callId,
+              expectedCall.stopLocalMediaForUnansweredDecline() else { return false }
+        locallyDeclinedIncomingCallIds.insert(callId)
+        locallyDeclinedIncomingCallIds.insert(expectedCall.signalingCallId)
+        return expectedCall.hasStoppedLocalMediaForUnansweredDecline
+    }
+
+    public func hasStoppedLocalMediaForUnansweredDecline(callId: UUID, expectedCall: Call) -> Bool {
+        guard Thread.isMainThread,
+              calls[callId] === expectedCall,
+              expectedCall.callInfo?.callId == callId,
+              locallyDeclinedIncomingCallIds.contains(callId),
+              locallyDeclinedIncomingCallIds.contains(expectedCall.signalingCallId) else { return false }
+        return expectedCall.hasStoppedLocalMediaForUnansweredDecline
+    }
+
+    private func isLocallyDeclinedIncomingCall(appCallId: UUID, signalingCallId: UUID) -> Bool {
+        locallyDeclinedIncomingCallIds.contains(appCallId) ||
+            locallyDeclinedIncomingCallIds.contains(signalingCallId)
     }
 
     /// Ends an active call after the exact `BYE` transaction is acknowledged on the
@@ -2373,6 +2399,11 @@ extension TxClient {
             signalingCallId = callId
         }
 
+        guard !isLocallyDeclinedIncomingCall(
+            appCallId: appFacingCallId,
+            signalingCallId: signalingCallId
+        ) else { return }
+
         let passiveInvite = passivePushInviteCallId == appFacingCallId
         let reattachedPreferredCodecs = isAttach
             ? self.calls[appFacingCallId]?.preferredAudioCodecs
@@ -2479,8 +2510,12 @@ extension TxClient {
                                         serverConfiguration: TxServerConfiguration,
                                         pushMetaData: [String: Any],
                                         authenticateForInvite: Bool = false) throws {
-        
-        
+        let requestedCallId = (pushMetaData["call_id"] as? String).flatMap(UUID.init(uuidString:))
+        if let requestedCallId,
+           isLocallyDeclinedIncomingCall(appCallId: requestedCallId, signalingCallId: requestedCallId) {
+            return
+        }
+
         let rtc_id = (pushMetaData["voice_sdk_id"] as? String)
         
         // Check if we are already connected and logged in
@@ -2491,7 +2526,6 @@ extension TxClient {
             throw TxError.clientConfigurationFailed(reason: .voiceSdkIsRequired)
         }
         
-        let requestedCallId = (pushMetaData["call_id"] as? String).flatMap(UUID.init(uuidString:))
         let noActiveCalls = self.calls.filter {
             $0.value.callState.isConsideredActive
         }.isEmpty
