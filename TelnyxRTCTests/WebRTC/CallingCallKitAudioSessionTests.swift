@@ -103,7 +103,7 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
     func testPreparationClearsInheritedMixingAndSpeakerDefaults() throws {
         try session.setCategory(
             .playAndRecord, mode: .voiceChat,
-            options: [.duckOthers, .allowBluetooth, .defaultToSpeaker]
+            options: [.duckOthers, .mixWithOthers, .allowBluetooth, .defaultToSpeaker]
         )
         XCTAssertTrue(session.categoryOptions.contains(.mixWithOthers))
 
