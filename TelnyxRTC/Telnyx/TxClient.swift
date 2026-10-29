@@ -303,7 +303,7 @@ public class TxClient {
         defer { rtcAudioSession.unlockForConfiguration() }
 
         let configuration = RTCAudioSessionConfiguration.webRTC()
-        configuration.categoryOptions = [.duckOthers, .allowBluetooth]
+        configuration.categoryOptions = [.allowBluetooth]
         try rtcAudioSession.setConfiguration(configuration)
     }
     

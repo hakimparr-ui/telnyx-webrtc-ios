@@ -88,7 +88,33 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
         XCTAssertEqual(session.category, .playAndRecord)
         XCTAssertEqual(session.mode, .voiceChat)
         XCTAssertTrue(session.categoryOptions.contains(.allowBluetooth))
+        XCTAssertFalse(session.categoryOptions.contains(.duckOthers))
+        XCTAssertFalse(session.categoryOptions.contains(.mixWithOthers))
+        XCTAssertFalse(session.categoryOptions.contains(.defaultToSpeaker))
         XCTAssertTrue(rtc.useManualAudio)
+        XCTAssertFalse(rtc.isAudioEnabled)
+        XCTAssertFalse(rtc.isActive)
+        XCTAssertEqual(try activationCount(), originalActivationCount)
+        XCTAssertEqual(recorder.interruptionEnds, 0)
+        XCTAssertEqual(recorder.devicePermissions, [])
+        XCTAssertEqual(activationRecorder.requests, [])
+    }
+
+    func testPreparationClearsInheritedMixingAndSpeakerDefaults() throws {
+        try session.setCategory(
+            .playAndRecord, mode: .voiceChat,
+            options: [.duckOthers, .allowBluetooth, .defaultToSpeaker]
+        )
+        XCTAssertTrue(session.categoryOptions.contains(.mixWithOthers))
+
+        try client.prepareAudioSessionForCallKit()
+
+        XCTAssertEqual(session.category, .playAndRecord)
+        XCTAssertEqual(session.mode, .voiceChat)
+        XCTAssertTrue(session.categoryOptions.contains(.allowBluetooth))
+        XCTAssertFalse(session.categoryOptions.contains(.duckOthers))
+        XCTAssertFalse(session.categoryOptions.contains(.mixWithOthers))
+        XCTAssertFalse(session.categoryOptions.contains(.defaultToSpeaker))
         XCTAssertFalse(rtc.isAudioEnabled)
         XCTAssertFalse(rtc.isActive)
         XCTAssertEqual(try activationCount(), originalActivationCount)
