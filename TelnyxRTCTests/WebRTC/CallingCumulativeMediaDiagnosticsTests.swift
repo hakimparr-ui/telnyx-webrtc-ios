@@ -84,7 +84,8 @@ final class CallingCumulativeMediaDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Set(source.keys), ["timestampMs", "totalAudioEnergy", "totalSamplesDuration"])
         XCTAssertEqual(Set(transport.keys), [
             "timestampMs", "currentRoundTripTime", "localProtocol", "remoteProtocol",
-            "localCandidateType", "remoteCandidateType",
+            "localCandidateType", "remoteCandidateType", "packetsSent", "bytesSent",
+            "packetsReceived", "bytesReceived", "packetsDiscardedOnSend", "bytesDiscardedOnSend",
         ])
         for value in [safeSDK, result] {
             let text = String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
@@ -183,7 +184,12 @@ final class CallingCumulativeMediaDiagnosticsTests: XCTestCase {
         statistics["chosen-source"] = ["type": "media-source", "kind": "audio", "timestamp": maximum,
                                        "totalAudioEnergy": maximum, "totalSamplesDuration": maximum]
         statistics["chosen-pair"] = ["type": "candidate-pair", "timestamp": maximum, "currentRoundTripTime": maximum,
-                                     "localCandidateId": "chosen-local", "remoteCandidateId": "chosen-remote"]
+                                     "localCandidateId": "chosen-local", "remoteCandidateId": "chosen-remote",
+                                     "packetsSent": maximum, "bytesSent": maximum,
+                                     "packetsReceived": maximum, "bytesReceived": maximum,
+                                     "packetsDiscardedOnSend": maximum, "bytesDiscardedOnSend": maximum]
+        sample["reportsReceived"] = maximum
+        sample["roundTripTimeMeasurements"] = maximum
         let resolved = WebRTCStatsReporter.resolvingOutboundAudioDiagnostics(sample, from: statistics)
         let media = TelnyxPstnNativeQualitySnapshot.diagnosticMediaStats(inbound: sample, outbound: resolved, remoteInbound: sample)
         let detail: [String: Any] = [

@@ -277,6 +277,13 @@ class WebRTCStatsReporter {
             }
             return number
         }
+        func counter(_ value: Any?) -> Any {
+            guard let number = measurement(value) as? NSNumber,
+                  number.doubleValue.rounded(.towardZero) == number.doubleValue else {
+                return NSNull()
+            }
+            return number
+        }
         func choice(_ value: Any?, allowed: Set<String>) -> Any {
             guard let value = value as? String, allowed.contains(value) else {
                 return NSNull()
@@ -303,6 +310,12 @@ class WebRTCStatsReporter {
             "transport": [
                 "timestamp": measurement(pair?["timestamp"]),
                 "currentRoundTripTime": measurement(pair?["currentRoundTripTime"]),
+                "packetsSent": counter(pair?["packetsSent"]),
+                "bytesSent": counter(pair?["bytesSent"]),
+                "packetsReceived": counter(pair?["packetsReceived"]),
+                "bytesReceived": counter(pair?["bytesReceived"]),
+                "packetsDiscardedOnSend": counter(pair?["packetsDiscardedOnSend"]),
+                "bytesDiscardedOnSend": counter(pair?["bytesDiscardedOnSend"]),
                 "localProtocol": choice(local?["protocol"], allowed: protocols),
                 "remoteProtocol": choice(remote?["protocol"], allowed: protocols),
                 "localCandidateType": choice(local?["candidateType"], allowed: candidateTypes),
