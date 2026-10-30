@@ -10,6 +10,8 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
     private var session: AVAudioSession!
     private var recorder: CallKitAudioSessionRecorder!
     private var activationRecorder: OperatingSystemAudioActivationRecorder!
+    private var originalGlobalConfiguration: RTCAudioSessionConfiguration!
+    private var originalGlobalOptions: AVAudioSession.CategoryOptions = []
     private var originalManual = false
     private var originalEnabled = false
     private var originalActive = false
@@ -25,6 +27,8 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
         XCTAssertTrue(Thread.isMainThread)
         session = AVAudioSession.sharedInstance()
         rtc = RTCAudioSession.sharedInstance()
+        originalGlobalConfiguration = RTCAudioSessionConfiguration.webRTC()
+        originalGlobalOptions = originalGlobalConfiguration.categoryOptions
         originalManual = rtc.useManualAudio
         originalEnabled = rtc.isAudioEnabled
         originalActive = rtc.isActive
@@ -71,6 +75,8 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
             try? session.setPreferredSampleRate(originalPreferredSampleRate)
             try? session.setPreferredIOBufferDuration(originalPreferredBufferDuration)
         }
+        originalGlobalConfiguration.categoryOptions = originalGlobalOptions
+        XCTAssertTrue(RTCAudioSessionConfiguration.webRTC() === originalGlobalConfiguration)
         client?.disconnect()
         client = nil
         activationRecorder?.restore()
@@ -251,6 +257,63 @@ final class CallingCallKitAudioSessionTests: XCTestCase {
         XCTAssertEqual(activationRecorder.requests, [])
     }
 
+    func testEngineStartupKeepsPreparedPolicyAndExternalOwner() throws {
+        try checkEngineBoundary(inheritGlobalOptions: false, changeCurrentAfterPreparation: false)
+    }
+
+    func testEngineStartupClearsInheritedGlobalOptions() throws {
+        try checkEngineBoundary(inheritGlobalOptions: true, changeCurrentAfterPreparation: false)
+    }
+
+    func testEngineBoundaryDetectsAChangedCurrentConfiguration() throws {
+        try checkEngineBoundary(inheritGlobalOptions: true, changeCurrentAfterPreparation: true)
+    }
+
+    private func checkEngineBoundary(
+        inheritGlobalOptions: Bool,
+        changeCurrentAfterPreparation: Bool
+    ) throws {
+        if inheritGlobalOptions {
+            RTCAudioSessionConfiguration.webRTC().categoryOptions = [
+                .duckOthers, .mixWithOthers, .allowBluetooth, .defaultToSpeaker
+            ]
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        }
+        try client.prepareAudioSessionForCallKit()
+        let actualPreparedOptions = session.categoryOptions.rawValue
+        let requestedPreparedOptions = RTCAudioSessionConfiguration.webRTC().categoryOptions.rawValue
+        XCTAssertEqual(requestedPreparedOptions, AVAudioSession.CategoryOptions.allowBluetooth.rawValue)
+        client.isAudioDeviceEnabled = true
+        XCTAssertEqual(try activationCount(), originalActivationCount + 1)
+        if changeCurrentAfterPreparation {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        }
+        let boundary = try EngineConfigurationBoundaryRecorder(session: rtc)
+        defer { boundary.restore() }
+        rtc.lockForConfiguration()
+        var error: NSError?
+        let accepted = try boundary.invokeEngineConfiguration(error: &error)
+        rtc.unlockForConfiguration()
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(error?.domain, EngineConfigurationBoundaryRecorder.stopDomain)
+        XCTAssertEqual(boundary.configurationCalls, 1)
+        XCTAssertEqual(boundary.activeRequests, [true])
+        XCTAssertEqual(boundary.categoryWrites, changeCurrentAfterPreparation ? 1 : 0)
+        XCTAssertEqual(session.category, .playAndRecord)
+        XCTAssertEqual(session.mode, .voiceChat)
+        XCTAssertEqual(session.categoryOptions.rawValue, requestedPreparedOptions)
+        XCTAssertEqual(activationRecorder.requests, [])
+        XCTAssertEqual(try activationCount(), originalActivationCount + 2)
+        print("ENGINE_BOUNDARY actualPreparedOptions=\(actualPreparedOptions) requestedPreparedOptions=\(requestedPreparedOptions) inherited=\(inheritGlobalOptions) changedAfterPreparation=\(changeCurrentAfterPreparation) categoryWrites=\(boundary.categoryWrites) actualActivationRequests=\(activationRecorder.requests.count)")
+        rtc.lockForConfiguration()
+        try boundary.releaseEngineReference(error: &error)
+        rtc.unlockForConfiguration()
+        XCTAssertEqual(try activationCount(), originalActivationCount + 1)
+        XCTAssertTrue(rtc.isAudioEnabled)
+        XCTAssertTrue(rtc.isActive)
+        XCTAssertEqual(activationRecorder.requests, [])
+    }
+
     private func activationCount() throws -> Int {
         // The exact pinned WebRTC runtime keeps this counter behind its ObjC
         // private accessor. Read its real value instead of mirroring SDK state.
@@ -355,6 +418,88 @@ private final class AudioSessionConfigurationFailure {
         method_setImplementation(method, original)
         self.replacement = nil
         imp_removeBlock(replacement)
+    }
+
+    deinit { restore() }
+}
+
+private final class EngineConfigurationBoundaryRecorder {
+    static let stopDomain = "CallingEngineBoundaryIntentionalStop"
+    private typealias ConfigurationFunction = @convention(c) (
+        AnyObject, Selector, RTCAudioSessionConfiguration, Bool,
+        AutoreleasingUnsafeMutablePointer<NSError?>?
+    ) -> Bool
+    private typealias ConfigurationBlock = @convention(block) (
+        RTCAudioSession, RTCAudioSessionConfiguration, Bool,
+        AutoreleasingUnsafeMutablePointer<NSError?>?
+    ) -> Bool
+    private typealias CategoryFunction = @convention(c) (
+        AnyObject, Selector, NSString, NSString, UInt,
+        AutoreleasingUnsafeMutablePointer<NSError?>?
+    ) -> Bool
+    private typealias CategoryBlock = @convention(block) (
+        RTCAudioSession, NSString, NSString, UInt,
+        AutoreleasingUnsafeMutablePointer<NSError?>?
+    ) -> Bool
+    private typealias EngineFunction = @convention(c) (
+        AnyObject, Selector, AutoreleasingUnsafeMutablePointer<NSError?>?
+    ) -> Bool
+    private let session: RTCAudioSession
+    private var replacements: [(ObjectiveC.Method, IMP, IMP)] = []
+    private let configure: EngineFunction
+    private let unconfigure: EngineFunction
+    private(set) var configurationCalls = 0
+    private(set) var categoryWrites = 0
+    private(set) var activeRequests: [Bool] = []
+
+    init(session: RTCAudioSession) throws {
+        self.session = session
+        let cls = try XCTUnwrap(object_getClass(session))
+        let configureMethod = try XCTUnwrap(class_getInstanceMethod(cls, NSSelectorFromString("configureWebRTCSession:")))
+        let unconfigureMethod = try XCTUnwrap(class_getInstanceMethod(cls, NSSelectorFromString("unconfigureWebRTCSession:")))
+        configure = unsafeBitCast(method_getImplementation(configureMethod), to: EngineFunction.self)
+        unconfigure = unsafeBitCast(method_getImplementation(unconfigureMethod), to: EngineFunction.self)
+        let configurationSelector = NSSelectorFromString("setConfiguration:active:error:")
+        let configurationMethod = try XCTUnwrap(class_getInstanceMethod(cls, configurationSelector))
+        let originalConfiguration = unsafeBitCast(method_getImplementation(configurationMethod), to: ConfigurationFunction.self)
+        let configurationBlock: ConfigurationBlock = { [weak self] session, config, active, error in
+            self?.configurationCalls += 1
+            self?.activeRequests.append(active)
+            let applied = originalConfiguration(session, configurationSelector, config, active, error)
+            guard applied else { return false }
+            error?.pointee = NSError(domain: Self.stopDomain, code: 1)
+            return false
+        }
+        replace(configurationMethod, with: imp_implementationWithBlock(configurationBlock))
+        let categorySelector = NSSelectorFromString("setCategory:mode:options:error:")
+        let categoryMethod = try XCTUnwrap(class_getInstanceMethod(cls, categorySelector))
+        let originalCategory = unsafeBitCast(method_getImplementation(categoryMethod), to: CategoryFunction.self)
+        let categoryBlock: CategoryBlock = { [weak self] session, category, mode, options, error in
+            self?.categoryWrites += 1
+            return originalCategory(session, categorySelector, category, mode, options, error)
+        }
+        replace(categoryMethod, with: imp_implementationWithBlock(categoryBlock))
+    }
+
+    func invokeEngineConfiguration(error: AutoreleasingUnsafeMutablePointer<NSError?>?) throws -> Bool {
+        configure(session, NSSelectorFromString("configureWebRTCSession:"), error)
+    }
+
+    func releaseEngineReference(error: AutoreleasingUnsafeMutablePointer<NSError?>?) throws {
+        XCTAssertTrue(unconfigure(session, NSSelectorFromString("unconfigureWebRTCSession:"), error))
+    }
+
+    private func replace(_ method: ObjectiveC.Method, with replacement: IMP) {
+        replacements.append((method, method_getImplementation(method), replacement))
+        method_setImplementation(method, replacement)
+    }
+
+    func restore() {
+        for (method, original, replacement) in replacements.reversed() {
+            method_setImplementation(method, original)
+            imp_removeBlock(replacement)
+        }
+        replacements.removeAll()
     }
 
     deinit { restore() }
