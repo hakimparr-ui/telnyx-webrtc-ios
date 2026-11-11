@@ -195,6 +195,7 @@ class Peer : NSObject, WebRTCEventHandler {
                   forceRelayCandidate: Bool = false,
                   useTrickleIce: Bool = false,
                   isAnswering: Bool = false,
+                  audioJitterBufferMode: TxAudioJitterBufferMode = .standard,
                   factory: RTCPeerConnectionFactory = Peer.factory) {
         self.connectionFactory = factory
         self.configuredIceServers = iceServers
@@ -202,6 +203,10 @@ class Peer : NSObject, WebRTCEventHandler {
 
         let config = RTCConfiguration()
         config.iceServers = iceServers
+        if case .responsive = audioJitterBufferMode {
+            config.audioJitterBufferMaxPackets = 50
+            config.audioJitterBufferFastAccelerate = true
+        }
 
         // Unified plan is more superior than planB
         config.sdpSemantics = .unifiedPlan

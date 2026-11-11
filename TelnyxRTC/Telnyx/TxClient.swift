@@ -190,6 +190,7 @@ public class TxClient {
     private var currentCallId: UUID = UUID()
     private var pendingAnswerHeaders = [String:String]()
     private var pendingAnswerPreferredCodecs: [TxCodecCapability]?
+    private var pendingAnswerAudioJitterBufferMode: TxAudioJitterBufferMode = .standard
     internal var sendFileLogs: Bool = false
     private var attachCallId: String?
     private var pushMetaData: [String:Any]?
@@ -1418,7 +1419,8 @@ public class TxClient {
     public func answerFromCallkit(answerAction: CXAnswerCallAction,
                                   customHeaders: [String:String] = [:],
                                   debug: Bool = false,
-                                  preferredCodecs: [TxCodecCapability]? = nil) {
+                                  preferredCodecs: [TxCodecCapability]? = nil,
+                                  audioJitterBufferMode: TxAudioJitterBufferMode = .standard) {
         Logger.log.i(message: "TxClient:: answerFromCallkit - started for callId: \(String(describing: answerAction.callUUID))")
         self.answerCallAction = answerAction
 
@@ -1428,6 +1430,7 @@ public class TxClient {
             /// Let's Keep track of the `customHeaders` passed
             pendingAnswerHeaders = customHeaders
             pendingAnswerPreferredCodecs = preferredCodecs
+            pendingAnswerAudioJitterBufferMode = audioJitterBufferMode
             /// Set call quality metrics
             self.enableQualityMetrics = debug
 
@@ -1456,7 +1459,8 @@ public class TxClient {
         if let currentCall = self.calls[currentCallId] {
             currentCall.answer(customHeaders: customHeaders,
                                debug: debug,
-                               preferredCodecs: preferredCodecs)
+                               preferredCodecs: preferredCodecs,
+                               audioJitterBufferMode: audioJitterBufferMode)
             answerCallAction?.fulfill()
             resetPushVariables()
             Logger.log.i(message: "answered from callkit")
@@ -1464,6 +1468,7 @@ public class TxClient {
             /// Let's Keep track of the `customHeaders` passed
             pendingAnswerHeaders = customHeaders
             pendingAnswerPreferredCodecs = preferredCodecs
+            pendingAnswerAudioJitterBufferMode = audioJitterBufferMode
             /// Set call quality metrics
             self.enableQualityMetrics = debug
         }
@@ -1521,6 +1526,7 @@ public class TxClient {
         pushInviteLoginSocket = nil
         pendingAnswerHeaders = [:]
         pendingAnswerPreferredCodecs = nil
+        pendingAnswerAudioJitterBufferMode = .standard
         answerCallAction = nil
         endCallAction = nil
         storedTxConfig = nil
@@ -2280,7 +2286,8 @@ extension TxClient {
                         clientState: String? = nil,
                         customHeaders:[String:String] = [:],
                         preferredCodecs: [TxCodecCapability]? = nil,
-                        debug:Bool = false) throws -> Call {
+                        debug:Bool = false,
+                        audioJitterBufferMode: TxAudioJitterBufferMode = .standard) throws -> Call {
         //User needs to be logged in to get a sessionId
         guard let sessionId = self.sessionId else {
             throw TxError.callFailed(reason: .sessionIdIsRequired)
@@ -2316,6 +2323,7 @@ extension TxClient {
                         pushWhenActive: self.txConfig?.pushWhenActive ?? false,
                         pushDeviceToken: self.txConfig?.pushNotificationConfig?.pushDeviceToken,
                         peerFactory: peerFactory)
+        call.audioJitterBufferMode = audioJitterBufferMode
         call.newCall(callerName: callerName,
                      callerNumber: callerNumber,
                      destinationNumber: destinationNumber,
@@ -2409,6 +2417,10 @@ extension TxClient {
             ? self.calls[appFacingCallId]?.preferredAudioCodecs
             : nil
 
+        let reattachedAudioJitterBufferMode = isAttach
+            ? self.calls[appFacingCallId]?.audioJitterBufferMode
+            : nil
+
         // Remove placeholder call if it exists from processVoIPNotification
         if appFacingCallId != signalingCallId {
             self.calls.removeValue(forKey: appFacingCallId)
@@ -2455,7 +2467,8 @@ extension TxClient {
             call.acceptReAttach(
                 peer: nil,
                 debug: enableQualityMetrics,
-                preferredCodecs: reattachedPreferredCodecs
+                preferredCodecs: reattachedPreferredCodecs,
+                audioJitterBufferMode: reattachedAudioJitterBufferMode
             )
             return
         }
@@ -2484,7 +2497,7 @@ extension TxClient {
             self.delegate?.onPushCall(call: call)
             //Answer is pending from push - Answer Call
             if(answerCallAction != nil){
-                call.answer(customHeaders: pendingAnswerHeaders, debug: enableQualityMetrics, preferredCodecs: pendingAnswerPreferredCodecs)
+                call.answer(customHeaders: pendingAnswerHeaders, debug: enableQualityMetrics, preferredCodecs: pendingAnswerPreferredCodecs, audioJitterBufferMode: pendingAnswerAudioJitterBufferMode)
                 answerCallAction?.fulfill()
                 resetPushVariables()
             }

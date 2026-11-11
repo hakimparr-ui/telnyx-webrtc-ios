@@ -8,6 +8,11 @@
 
 import Foundation
 
+public enum TxAudioJitterBufferMode {
+    case standard
+    case responsive
+}
+
 
 /// 
 struct TxCallOptions {

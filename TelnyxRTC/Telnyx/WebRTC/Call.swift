@@ -221,6 +221,7 @@ public class Call {
     var peer: Peer?
     private let peerFactory: RTCPeerConnectionFactory
     private var answerPreferredCodecs: [TxCodecCapability]?
+    internal var audioJitterBufferMode: TxAudioJitterBufferMode = .standard
     private let terminationLock = NSRecursiveLock()
     private var terminationStarted = false
     private var localDeclineMediaStopped = false
@@ -644,7 +645,7 @@ public class Call {
         // - Start the reporter once the peer connection is created
         self.configureStatsReporter()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Creating Peer for outbound call with useTrickleIce = \(self.useTrickleIce)")
-        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: false, factory: peerFactory)
+        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: false, audioJitterBufferMode: audioJitterBufferMode, factory: peerFactory)
         self.startStatsReporter()
         self.peer?.delegate = self
         self.peer?.socket = self.socket
@@ -1024,7 +1025,7 @@ extension Call {
     ///     converted to underscores in variable names.
     ///   - debug: (optional) Enable debug mode for call quality metrics and WebRTC statistics.
     ///     When enabled, real-time call quality metrics will be available through the `onCallQualityChange` callback.
-    public func answer(customHeaders:[String:String] = [:], debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
+    public func answer(customHeaders:[String:String] = [:], debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil, audioJitterBufferMode: TxAudioJitterBufferMode = .standard) {
         terminationLock.lock()
         guard !terminationStarted, !localDeclineMediaStopped, callState != .DONE() else {
             terminationLock.unlock()
@@ -1033,6 +1034,7 @@ extension Call {
         answerStarted = true
         terminationLock.unlock()
         self.answerPreferredCodecs = preferredCodecs
+        self.audioJitterBufferMode = audioJitterBufferMode
         // Start benchmarking for inbound calls when answer is called
         CallTimingBenchmark.start(isOutbound: false)
         CallTimingBenchmark.mark(CallBenchmarkMilestone.acceptCallStarted)
@@ -1046,7 +1048,7 @@ extension Call {
         self.answerCustomHeaders = customHeaders
         self.configureStatsReporter()
         Logger.log.i(message: "[TRICKLE-ICE] Call:: Creating Peer for inbound call answer with useTrickleIce = \(self.useTrickleIce)")
-        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: true, factory: peerFactory)
+        self.peer = Peer(iceServers: self.iceServers, forceRelayCandidate: self.forceRelayCandidate, useTrickleIce: self.useTrickleIce, isAnswering: true, audioJitterBufferMode: audioJitterBufferMode, factory: peerFactory)
         self.enableQualityMetrics = debug
         self.startStatsReporter()
         self.peer?.delegate = self
@@ -1068,7 +1070,7 @@ extension Call {
     ///  - Parameters:
     ///         - customHeaders: (optional) Custom Headers to be passed over webRTC Messages, should be in the
     ///     format `X-key:Value` `X` is required for headers to be passed.
-    internal func acceptReAttach(peer: Peer?, customHeaders:[String:String] = [:],debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil) {
+    internal func acceptReAttach(peer: Peer?, customHeaders:[String:String] = [:],debug:Bool = false, preferredCodecs: [TxCodecCapability]? = nil, audioJitterBufferMode: TxAudioJitterBufferMode? = nil) {
         terminationLock.lock()
         guard !terminationStarted, !localDeclineMediaStopped, callState != .DONE() else {
             terminationLock.unlock()
@@ -1077,6 +1079,7 @@ extension Call {
         answerStarted = true
         terminationLock.unlock()
         if let preferredCodecs { answerPreferredCodecs = preferredCodecs }
+        if let audioJitterBufferMode { self.audioJitterBufferMode = audioJitterBufferMode }
         //TODO: Create an error if there's no remote SDP
         guard let remoteSdp = self.remoteSdp else {
             return
@@ -1093,6 +1096,7 @@ extension Call {
                          forceRelayCandidate: self.forceRelayCandidate,
                          useTrickleIce: self.useTrickleIce,
                          isAnswering: false,
+                         audioJitterBufferMode: self.audioJitterBufferMode,
                          factory: peerFactory)
         self.startStatsReporter()
         self.peer?.delegate = self
