@@ -127,6 +127,7 @@ public extension Notification.Name {
 public class TxClient {
 
     internal var peerFactory: RTCPeerConnectionFactory = Peer.factory
+    public var reattachmentAudioJitterBufferModeResolver: ((UUID, [String: String]) -> TxAudioJitterBufferMode)?
     private struct PendingDisablePush {
         let messageId: String
         let generation: UInt
@@ -2417,9 +2418,14 @@ extension TxClient {
             ? self.calls[appFacingCallId]?.preferredAudioCodecs
             : nil
 
-        let reattachedAudioJitterBufferMode = isAttach
-            ? self.calls[appFacingCallId]?.audioJitterBufferMode
-            : nil
+        let reattachedAudioJitterBufferMode: TxAudioJitterBufferMode?
+        if isAttach {
+            reattachedAudioJitterBufferMode = self.calls[appFacingCallId]?.audioJitterBufferMode
+                ?? reattachmentAudioJitterBufferModeResolver?(appFacingCallId, customHeaders)
+                ?? .standard
+        } else {
+            reattachedAudioJitterBufferMode = nil
+        }
 
         // Remove placeholder call if it exists from processVoIPNotification
         if appFacingCallId != signalingCallId {
