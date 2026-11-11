@@ -428,29 +428,62 @@ public class TelnyxCallReportCollector {
     private func parseStatsReport(_ report: RTCStatisticsReport) -> ParsedStats {
         var outboundAudio: RTCOutboundRTPStreamStats?
         var inboundAudio: RTCInboundRTPStreamStats?
-        var candidatePair: RTCIceCandidatePairStats?
+        var outboundTransportId: String?
+        var inboundTransportId: String?
 
         for stats in report.statistics.values {
             switch stats.type {
             case "outbound-rtp":
                 if let kind = stats.values["kind"] as? String, kind == "audio" {
                     outboundAudio = RTCOutboundRTPStreamStats(stats)
+                    outboundTransportId = stats.values["transportId"] as? String
                 }
             case "inbound-rtp":
                 if let kind = stats.values["kind"] as? String, kind == "audio" {
                     inboundAudio = RTCInboundRTPStreamStats(stats)
-                }
-            case "candidate-pair":
-                let nominated = stats.values["nominated"] as? Bool ?? false
-                let state = stats.values["state"] as? String ?? ""
-                if nominated || state == "succeeded" {
-                    candidatePair = RTCIceCandidatePairStats(stats)
+                    inboundTransportId = stats.values["transportId"] as? String
                 }
             default:
                 break
             }
         }
+        let statistics = report.statistics.mapValues { stats -> [String: Any] in
+            var values = stats.values.mapValues { $0 as Any }
+            values["type"] = stats.type
+            return values
+        }
+        let transportId = outboundAudio != nil ? outboundTransportId : inboundTransportId
+        let selectedId = outboundAudio != nil || inboundAudio != nil
+            ? Self.selectedAudioCandidatePairId(transportId: transportId, statistics: statistics)
+            : nil
+        let candidatePair = selectedId.flatMap { report.statistics[$0] }.map(RTCIceCandidatePairStats.init)
         return ParsedStats(outbound: outboundAudio, inbound: inboundAudio, candidate: candidatePair)
+    }
+
+    internal static func selectedAudioCandidatePairId(
+        transportId: String?,
+        statistics: [String: [String: Any]]
+    ) -> String? {
+        if let transportId = transportId {
+            guard let transport = statistics[transportId],
+                  transport["type"] as? String == "transport" else { return nil }
+            if transport["selectedCandidatePairId"] != nil {
+                guard let selectedId = transport["selectedCandidatePairId"] as? String,
+                      statistics[selectedId]?["type"] as? String == "candidate-pair" else { return nil }
+                return selectedId
+            }
+        } else if statistics.values.contains(where: {
+            $0["type"] as? String == "transport" && $0["selectedCandidatePairId"] != nil
+        }) {
+            return nil
+        }
+        let selected = statistics.filter { _, stats in
+            guard stats["type"] as? String == "candidate-pair",
+                  stats["selected"] as? Bool == true,
+                  stats["state"] as? String == "succeeded" else { return false }
+            return transportId == nil || stats["transportId"] as? String == transportId
+        }
+        return selected.count == 1 ? selected.first?.key : nil
     }
 
     private func accumulateSamples(
